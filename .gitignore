@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+env/
+
+# Node.js
+node_modules/
+
+# Rust
+target/
+src-tauri/target/
+
+# Build outputs
+dist/
+build/
+*.app
+*.dmg
+releases/
+
+# macOS
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# Environment
+.env
+.env.local
+.env.*.local
