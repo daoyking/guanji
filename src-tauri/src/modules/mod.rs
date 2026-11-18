@@ -7,3 +7,5 @@ pub mod clipboard;
 pub mod memory;
 pub mod notification;
 pub mod agent;
+pub mod shell;
+pub mod reminder;

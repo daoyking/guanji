@@ -24,10 +24,10 @@ interface Message {
 const SUGGESTIONS = [
   '检查所有本地服务的健康状态',
   '扫描下载目录里的大文件',
-  '现在有哪些进程占用内存最高？',
-  '看看我的剪贴板历史',
   '记住：我偏好深色主题',
-  '列出所有定时任务',
+  '5分钟后提醒我休息一下',
+  '用命令看看磁盘剩余空间',
+  '打开 Safari 浏览器',
 ];
 
 const TOOL_LABELS: Record<string, string> = {
@@ -36,6 +36,9 @@ const TOOL_LABELS: Record<string, string> = {
   list_services: '服务列表', probe_service: '服务探测', run_all_probes: '全部服务探测',
   clip_list: '剪贴板', list_tasks: '定时任务', add_task: '创建任务',
   mem_list: '记忆列表', mem_add: '记忆存储', mem_search: '记忆搜索', notify: '桌面通知',
+  run_command: '执行命令', open_target: '打开应用/文件',
+  read_file: '读取文件', write_file: '写入文件',
+  set_reminder: '设置提醒', list_reminders: '查看提醒', delete_reminder: '删除提醒',
 };
 
 function now() {
@@ -46,7 +49,7 @@ export default function AgentChat() {
   const [messages, setMessages] = useState<Message[]>([{
     id: 'welcome',
     role: 'assistant',
-    content: '你好，我是管家。直接用中文告诉我你想做什么——查进程、清文件、看服务、定任务、记事情，我来判断该调用哪些工具并一步步做完。',
+    content: '你好，我是管家。直接用中文下达指令——查系统、跑命令、读写文件、打开应用、设定时提醒、记事情，我来判断该调用哪些工具并一步步做完，还会从成败经验里越来越懂你。',
     time: now(),
   }]);
   const [input, setInput] = useState('');

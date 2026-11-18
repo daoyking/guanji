@@ -54,8 +54,29 @@ pub fn init_db() -> Result<(), Box<dyn std::error::Error>> {
             created_at REAL NOT NULL,
             pinned INTEGER NOT NULL DEFAULT 0
         );
+        CREATE TABLE IF NOT EXISTS reminders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            message TEXT NOT NULL,
+            remind_at TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            fired INTEGER NOT NULL DEFAULT 0
+        );
         ",
     )?;
+    // 幂等 migration：老库的 memories 表可能缺少 tag/summary 列。
+    // mem_add / 经验沉淀 / 语义搜索都依赖这两列，缺列会导致运行时 SQL 报错。
+    {
+        let cols: Vec<String> = conn
+            .prepare("PRAGMA table_info(memories)")?
+            .query_map([], |r| r.get::<_, String>(1))?
+            .collect::<SqlResult<Vec<_>>>()?;
+        if !cols.iter().any(|c| c == "tag") {
+            conn.execute("ALTER TABLE memories ADD COLUMN tag TEXT", [])?;
+        }
+        if !cols.iter().any(|c| c == "summary") {
+            conn.execute("ALTER TABLE memories ADD COLUMN summary TEXT", [])?;
+        }
+    }
     DB.set(Mutex::new(conn))
         .map_err(|_| "Database already initialized".to_string())?;
     Ok(())

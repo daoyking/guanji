@@ -69,9 +69,18 @@ fn main() {
             // AI Agent orchestration (M8)
             modules::agent::agent_chat,
             modules::agent::agent_model_name,
+            // Butler execution tools (M8.1)
+            modules::shell::run_command,
+            modules::shell::open_target,
+            modules::shell::read_text_file,
+            modules::shell::write_text_file,
+            modules::reminder::reminder_add,
+            modules::reminder::reminder_list,
+            modules::reminder::reminder_delete,
         ])
-        .setup(|_app| {
+        .setup(|app| {
             modules::tasks::spawn_task_runner();
+            modules::reminder::spawn_reminder_runner(app.handle().clone());
             Ok(())
         })
         .run(tauri::generate_context!())

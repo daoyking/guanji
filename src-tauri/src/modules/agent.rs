@@ -81,6 +81,31 @@ fn tools_schema() -> Vec<Value> {
             "title": {"type":"string","description":"通知标题"},
             "body": {"type":"string","description":"通知内容"}
         })),
+        // ── 管家级执行工具 ──
+        tool("run_command", "在电脑上执行一条 shell 命令（危险命令会被安全拦截）。用于真正做事：查系统状态、启动服务、批量文件操作等", json!({
+            "command": {"type":"string","description":"要执行的 shell 命令"},
+            "cwd": {"type":"string","description":"可选：工作目录"}
+        })),
+        tool("open_target", "用系统默认程序打开应用、文件或网址（如 open -a Safari 或打开某个 App）", json!({
+            "target": {"type":"string","description":"应用名、文件路径或 URL"}
+        })),
+        tool("read_file", "读取一个 UTF-8 文本文件的内容（上限 100KB）", json!({
+            "path": {"type":"string","description":"文件绝对路径"},
+            "max_chars": {"type":"integer","description":"可选：最多返回字符数，默认8000"}
+        })),
+        tool("write_file", "写入文本文件（自动创建目录；系统目录受保护）。用于写笔记、配置、脚本", json!({
+            "path": {"type":"string","description":"文件绝对路径"},
+            "content": {"type":"string","description":"要写入的内容"},
+            "append": {"type":"boolean","description":"可选：是否追加，默认覆盖"}
+        })),
+        tool("set_reminder", "设置一个定时提醒，到点会弹系统通知。支持「5分钟后」「2小时后」「明天10点」等说法", json!({
+            "message": {"type":"string","description":"提醒内容"},
+            "when": {"type":"string","description":"时间，如 5分钟后 / 2小时后 / ISO8601"}
+        })),
+        tool("list_reminders", "查看所有还未触发的提醒", json!({})),
+        tool("delete_reminder", "删除一条提醒", json!({
+            "id": {"type":"integer","description":"提醒ID"}
+        })),
     ]
 }
 
@@ -101,29 +126,86 @@ fn tool(name: &str, desc: &str, props: Value) -> Value {
 
 // ─── 自主进化：从历史轨迹中提取经验 ───────────────────────────
 
-fn load_experiences() -> Vec<String> {
-    std::thread::spawn(|| {
+/// 中文按二元字组切分，用于无分词器场景下的轻量相关度计算
+fn text_bigrams(s: &str) -> std::collections::HashSet<String> {
+    let chars: Vec<char> = s.chars().filter(|c| !c.is_whitespace()).collect();
+    let mut set = std::collections::HashSet::new();
+    if chars.len() == 1 {
+        set.insert(chars[0].to_string());
+        return set;
+    }
+    for w in chars.windows(2) {
+        set.insert(w.iter().collect());
+    }
+    set
+}
+
+fn relevance(intent: &str, candidate: &str) -> f32 {
+    let a = text_bigrams(intent);
+    let b = text_bigrams(candidate);
+    if a.is_empty() || b.is_empty() { return 0.0; }
+    let inter = a.intersection(&b).count();
+    let union = a.union(&b).count();
+    if union == 0 { 0.0 } else { inter as f32 / union as f32 }
+}
+
+/// 按与当前意图的相关度检索历史经验，分离「成功做法」与「失败教训」
+fn load_experiences(intent: &str) -> (Vec<String>, Vec<String>) {
+    let rows = std::thread::spawn(|| {
         with_db(|conn| {
             let mut stmt = conn.prepare(
-                "SELECT content FROM memories WHERE tag='agent_experience' \
-                 ORDER BY created_at DESC LIMIT 6",
+                "SELECT tag, content, COALESCE(summary,'') FROM memories \
+                 WHERE tag IN ('agent_experience','agent_failure') \
+                 ORDER BY created_at DESC LIMIT 80",
             )?;
-            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+            let rows = stmt.query_map([], |r| Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            )))?;
             rows.collect::<rusqlite::Result<Vec<_>>>()
         })
     })
     .join()
     .ok()
     .and_then(|r| r.ok())
-    .unwrap_or_default()
+    .unwrap_or_default();
+
+    let mut successes: Vec<(f32, String)> = Vec::new();
+    let mut failures: Vec<(f32, String)> = Vec::new();
+    for (tag, content, summary) in rows {
+        let score = relevance(intent, &summary);
+        if tag == "agent_failure" {
+            failures.push((score, content));
+        } else {
+            successes.push((score, content));
+        }
+    }
+    let by_score = |a: &(f32, String), b: &(f32, String)| {
+        b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal)
+    };
+    successes.sort_by(by_score);
+    failures.sort_by(by_score);
+    (
+        successes.into_iter().take(4).map(|x| x.1).collect(),
+        failures.into_iter().take(3).map(|x| x.1).collect(),
+    )
 }
 
-fn system_prompt(experiences: &[String]) -> String {
-    let exp_block = if experiences.is_empty() {
+fn system_prompt(successes: &[String], failures: &[String]) -> String {
+    let exp_block = if successes.is_empty() && failures.is_empty() {
         "尚无历史经验，这是第一次协作。".to_string()
     } else {
-        format!("你过去的成功经验（供参考，可直接复用相同工具组合）：\n{}",
-            experiences.iter().map(|e| format!("- {}", e)).collect::<Vec<_>>().join("\n"))
+        let mut block = String::new();
+        if !successes.is_empty() {
+            block.push_str("你过去的相关成功经验（优先复用相同工具组合）：\n");
+            for e in successes { block.push_str(&format!("- {}\n", e)); }
+        }
+        if !failures.is_empty() {
+            block.push_str("\n你过去踩过的坑（务必避免重蹈覆辙）：\n");
+            for e in failures { block.push_str(&format!("- {}\n", e)); }
+        }
+        block
     };
     format!(r#"你是「管家」，一台 macOS 电脑的全能 AI Agent。用户用中文下达指令，你通过调用工具真正把事情做完，而不是只给建议。
 
@@ -133,8 +215,9 @@ fn system_prompt(experiences: &[String]) -> String {
 3. 信息足够时，用简洁中文给出最终答案（不要复述工具原始输出）。
 
 ## 工具调用格式（严格遵守）
-只输出一个 JSON 对象，不要输出其它任何文字：
+只输出一个 JSON 对象，不要输出其它任何文字。必须是下面这种带 name / arguments 两个键的格式：
 {{"name": "工具名", "arguments": {{...}}}}
+❌ 绝对不要输出 {{"工具名": {{...}}}} 这种把工具名当键的格式，那是错误的。
 若无需调用工具、可直接回答，输出：
 {{"answer": "你的最终回答"}}
 
@@ -145,6 +228,10 @@ fn system_prompt(experiences: &[String]) -> String {
 
 ## 行为准则
 - 用户说「记住/别忘了」时，用 mem_add 工具记下来。
+- 用户要「打开某个应用/文件/网页」时，用 open_target。
+- 用户要「读某个文件/写点什么/生成脚本」时，用 read_file / write_file。
+- 用户要「定闹钟/提醒我 X 分钟后」时，用 set_reminder。
+- 需要真正执行系统操作时用 run_command（危险命令会被自动拦截，可放心尝试）。
 - 文件删除、清理类操作前先扫描确认，再执行，并在回答中说清楚做了什么。
 - 任务完成后，如果结果重要，用 notify 工具告知用户。
 - 回答用中文，简洁、直接、有条理。"#,
@@ -213,6 +300,17 @@ fn parse_model_output(content: &str, native_calls: Option<&Vec<Value>>) -> Resul
             if let Some(name) = v.get("name").or_else(|| v.get("tool")).and_then(|x| x.as_str()) {
                 let args = v.get("arguments").or_else(|| v.get("args")).cloned().unwrap_or_else(|| json!({}));
                 return Ok((Some(name.to_string()), args, None));
+            }
+            // 3b) 字典式调用：{"mem_add": {"content": ...}} —— 本地小模型常见变体
+            if let Some(obj) = v.as_object() {
+                if obj.len() == 1 {
+                    if let Some((k, val)) = obj.iter().next() {
+                        // 排除 answer/final/thought 等语义键，只把「值为对象」的单键当工具名
+                        if !matches!(k.as_str(), "answer" | "final" | "thought" | "result") && val.is_object() {
+                            return Ok((Some(k.clone()), val.clone(), None));
+                        }
+                    }
+                }
             }
         }
     }
@@ -328,23 +426,76 @@ async fn execute_tool(app: &AppHandle, name: &str, args: &Value) -> Result<Strin
             let body = args["body"].as_str().unwrap_or("").to_string();
             crate::modules::notification::notify_push(app.clone(), title, body, None, None).await
         }
+        "run_command" => {
+            let command = args["command"].as_str().unwrap_or("").to_string();
+            let cwd = args["cwd"].as_str().map(String::from);
+            crate::modules::shell::run_command(command, cwd).await
+        }
+        "open_target" => {
+            let target = args["target"].as_str().unwrap_or("").to_string();
+            crate::modules::shell::open_target(target).await
+        }
+        "read_file" => {
+            let path = args["path"].as_str().unwrap_or("").to_string();
+            let max_chars = args["max_chars"].as_u64().map(|n| n as usize);
+            crate::modules::shell::read_text_file(path, max_chars).await
+        }
+        "write_file" => {
+            let path = args["path"].as_str().unwrap_or("").to_string();
+            let content = args["content"].as_str().unwrap_or("").to_string();
+            let append = args["append"].as_bool();
+            crate::modules::shell::write_text_file(path, content, append).await
+        }
+        "set_reminder" => {
+            let message = args["message"].as_str().unwrap_or("提醒").to_string();
+            let when = args["when"].as_str().unwrap_or("").to_string();
+            crate::modules::reminder::reminder_add(message, when).await
+                .map(|id| format!("已设置提醒（id={}），到点会通知你", id))
+        }
+        "list_reminders" => Ok(json!(crate::modules::reminder::reminder_list().await?).to_string()),
+        "delete_reminder" => {
+            let id = args["id"].as_i64().unwrap_or(-1);
+            crate::modules::reminder::reminder_delete(id).await.map(|_| "已删除提醒".to_string())
+        }
         other => Err(format!("未知工具: {}", other)),
     }
 }
 
 // ─── 经验沉淀 ──────────────────────────────────────────────────
 
-fn save_experience(intent: &str, traces: &[ToolTrace]) {
+fn save_experience(intent: &str, traces: &[ToolTrace], success: bool) {
     let tools: Vec<String> = traces.iter().map(|t| t.tool.clone()).collect();
     if tools.is_empty() { return; }
-    let content = format!("用户意图「{}」→ 使用工具 [{}] 完成", intent,
-        tools.join(" → "));
+    let (tag, content) = if success {
+        (
+            "agent_experience",
+            format!("用户意图「{}」→ 使用工具 [{}] 成功完成", intent, tools.join(" → ")),
+        )
+    } else {
+        // 失败复盘：记录踩坑点，供后续同类意图规避
+        let failed_tools: Vec<String> = traces.iter()
+            .filter(|t| !t.ok)
+            .map(|t| format!("{}（{}）", t.tool,
+                t.result.chars().take(60).collect::<String>()))
+            .collect();
+        let reason = if failed_tools.is_empty() {
+            "在限定步数内未收敛".to_string()
+        } else {
+            format!("工具执行失败：{}", failed_tools.join("; "))
+        };
+        (
+            "agent_failure",
+            format!("用户意图「{}」→ 工具链 [{}] 失败，原因：{}。下次遇到类似意图应调整策略。",
+                intent, tools.join(" → "), reason),
+        )
+    };
     let intent_owned = intent.to_string();
+    let tag_owned = tag.to_string();
     let _ = std::thread::spawn(move || {
         with_db(|conn| {
             conn.execute(
-                "INSERT INTO memories (content, created_at, tag, summary) VALUES (?1, ?2, 'agent_experience', ?3)",
-                rusqlite::params![content, chrono::Utc::now().to_rfc3339(), intent_owned],
+                "INSERT INTO memories (content, created_at, tag, summary) VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![content, chrono::Utc::now().to_rfc3339(), tag_owned, intent_owned],
             )?;
             Ok(())
         })
@@ -355,9 +506,9 @@ fn save_experience(intent: &str, traces: &[ToolTrace]) {
 
 #[tauri::command]
 pub async fn agent_chat(app: AppHandle, message: String, history: Option<Vec<Value>>) -> Result<AgentReply, String> {
-    let experiences = load_experiences();
+    let (successes, failures) = load_experiences(&message);
     let mut messages: Vec<Value> = vec![
-        json!({"role": "system", "content": system_prompt(&experiences)}),
+        json!({"role": "system", "content": system_prompt(&successes, &failures)}),
     ];
     if let Some(h) = history {
         for m in h.into_iter().take(20) { messages.push(m); }
@@ -379,7 +530,9 @@ pub async fn agent_chat(app: AppHandle, message: String, history: Option<Vec<Val
             let answer = answer.unwrap_or_else(|| content.clone());
             // 推送完成事件
             let _ = app.emit("agent://done", json!({"answer": answer, "steps": step}));
-            save_experience(&message, &traces);
+            // 有轨迹且全部成功才算成功经验；工具曾失败但模型给了答案，记为失败教训
+            let all_ok = traces.iter().all(|t| t.ok);
+            save_experience(&message, &traces, all_ok);
             return Ok(AgentReply {
                 answer,
                 traces,
@@ -430,7 +583,7 @@ pub async fn agent_chat(app: AppHandle, message: String, history: Option<Vec<Val
 
     let answer = "抱歉，我在限定步数内没能完成任务。可能是工具结果不够明确，请换个说法或拆分指令再试。".to_string();
     let _ = app.emit("agent://done", json!({"answer": answer, "steps": MAX_STEPS}));
-    save_experience(&message, &traces);
+    save_experience(&message, &traces, false);
     Ok(AgentReply { answer, traces, steps: MAX_STEPS, model: agent_model() })
 }
 
@@ -498,6 +651,43 @@ mod tests {
         let (name, args, _) = parse_model_output(text, None).unwrap();
         assert_eq!(name.as_deref(), Some("list_processes"));
         assert_eq!(args["limit"], 20);
+    }
+
+    #[test]
+    fn parse_dict_style_tool_call() {
+        // qwen2.5-coder 常见变体：把工具名直接当 key
+        let text = r#"{"mem_add": {"content": "我喜欢深色主题", "tag": "preference", "summary": "主题偏好"}}"#;
+        let (name, args, answer) = parse_model_output(text, None).unwrap();
+        assert_eq!(name.as_deref(), Some("mem_add"));
+        assert_eq!(args["content"], "我喜欢深色主题");
+        assert_eq!(args["tag"], "preference");
+        assert!(answer.is_none());
+    }
+
+    #[test]
+    fn parse_dict_style_with_markdown() {
+        let text = "```json\n{\"notify\": {\"title\": \"完成\", \"body\": \"检查完毕\"}}\n```";
+        let (name, args, _) = parse_model_output(text, None).unwrap();
+        assert_eq!(name.as_deref(), Some("notify"));
+        assert_eq!(args["title"], "完成");
+    }
+
+    #[test]
+    fn relevance_ranks_related_intent_higher() {
+        let intent = "帮我看看下载目录里的大文件";
+        let related = "用户意图「扫描下载目录大文件」→ 使用工具 [scan_downloads] 成功完成";
+        let unrelated = "用户意图「记住我喜欢深色主题」→ 使用工具 [mem_add] 成功完成";
+        let r1 = relevance(intent, related);
+        let r2 = relevance(intent, unrelated);
+        assert!(r1 > r2, "related={} unrelated={}", r1, r2);
+        assert!(r1 > 0.1, "related too low: {}", r1);
+    }
+
+    #[test]
+    fn bigrams_handle_chinese() {
+        let set = text_bigrams("记忆");
+        assert!(set.contains("记忆"));
+        assert_eq!(set.len(), 1);
     }
 
     #[test]

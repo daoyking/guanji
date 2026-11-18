@@ -57,7 +57,8 @@ async fn collect_files(dir: &Path, threshold: u64, results: &mut Vec<FileEntry>)
 #[tauri::command]
 pub async fn scan_downloads(threshold_mb: Option<f64>) -> Result<Vec<FileEntry>, String> {
     let threshold = (threshold_mb.unwrap_or(100.0) * MB as f64) as u64;
-    let download_dir = dirs::download_dir().ok_or("Cannot find Downloads directory")?.join("Downloads");
+    // dirs::download_dir() 已指向 ~/Downloads，切勿再 join("Downloads") 造成嵌套
+    let download_dir = dirs::download_dir().ok_or("Cannot find Downloads directory")?;
     let mut results = Vec::new();
     collect_files(&download_dir, threshold, &mut results).await;
     results.sort_by(|a, b| b.size_mb.partial_cmp(&a.size_mb).unwrap());
