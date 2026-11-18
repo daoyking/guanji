@@ -95,17 +95,29 @@ fn is_ignored(path: &Path, ignores: &[String]) -> bool {
     }
     // 目录名逐层比对（一次遍历同时覆盖「名称匹配」）
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    // 解析符号链接：macOS 原生文件夹对话框返回的是链接指向的真实路径，
+    // 但扫描可能从 ~/Downloads 下的符号链接入口进入。两边都 canonicalize 后比较
+    // 才能让「忽略真实路径」对「链接入口」同样生效。
+    let path_canon = fs::canonicalize(path).ok();
     for rule in ignores {
         let rule = rule.trim();
         if rule.is_empty() {
             continue;
         }
         if rule.contains('/') || rule.starts_with('~') {
-            // 路径规则：展开 ~ 后做前缀匹配
+            // 路径规则：展开 ~ 后先做字符串前缀匹配
             let expanded = expand_tilde(rule);
             let rule_path = PathBuf::from(&expanded);
             if path == rule_path || path.starts_with(&rule_path) {
                 return true;
+            }
+            // 再做符号链接解析后的匹配（真实路径 vs 真实路径）
+            if let Some(pc) = &path_canon {
+                if let Ok(rc) = fs::canonicalize(&rule_path) {
+                    if *pc == rc || pc.starts_with(&rc) {
+                        return true;
+                    }
+                }
             }
         } else if name == rule {
             // 目录名规则
@@ -394,6 +406,29 @@ mod tests {
     }
 
     #[test]
+    fn ignore_path_rule_matches_symlink_entry() {
+        use std::os::unix::fs::symlink;
+        let root = std::env::temp_dir().join("gj_ignore_symlink_test");
+        let _ = fs::remove_dir_all(&root);
+        let real = root.join("real_target");
+        let link = root.join("link_entry");
+        fs::create_dir_all(&real).unwrap();
+        fs::create_dir_all(real.join("sub")).unwrap();
+        symlink(&real, &link).unwrap();
+
+        // 规则用真实路径（模拟原生对话框返回的值）
+        let ignores = vec![real.to_string_lossy().to_string()];
+        // 从符号链接入口进入时也应被忽略
+        assert!(is_ignored(&link, &ignores), "符号链接入口应命中真实路径规则");
+        assert!(is_ignored(&link.join("sub"), &ignores));
+        // 反向：规则用链接路径，真实路径也应命中
+        let link_rules = vec![link.to_string_lossy().to_string()];
+        assert!(is_ignored(&real, &link_rules), "真实路径应命中链接路径规则");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn empty_ignores_ignore_nothing() {
         assert!(!is_ignored(Path::new("/anything"), &[]));
     }
@@ -516,3 +551,4 @@ mod integration_tests {
         let _ = fs::remove_dir_all(&root);
     }
 }
+
