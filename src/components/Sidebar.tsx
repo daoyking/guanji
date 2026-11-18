@@ -54,7 +54,7 @@ export default function Sidebar({ currentPage, onPageChange }: SidebarProps) {
 
       {/* Footer */}
       <div className="px-4 py-3 border-t border-gray-200 dark:border-gray-700">
-        <p className="text-xs text-gray-400 dark:text-gray-500 text-center">v0.1.0 · α</p>
+        <p className="text-xs text-gray-400 dark:text-gray-500 text-center">v0.2.0 · α</p>
       </div>
     </aside>
   );

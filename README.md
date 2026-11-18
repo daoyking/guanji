@@ -1,9 +1,12 @@
-# 管家 (GuanJia) v0.1.0-alpha
+# 管家 (GuanJia) v0.2.0-alpha
 
-个人电脑管家 Tauri 应用原型。
-- Tech: Tauri 2 + React + Rust, 端口 1420
-- 已实现：Dashboard 仪表板（CPU/内存/磁盘实时），文件管家（大文件扫描、缓存清理），SQLite 数据库持久化（备忘录、设置）
-- 状态：V0.1 alpha，已集成 SQLite 数据库，正在推进全局快捷键与通知系统
+一句话指令驱动的本机全能 AI Agent。
+- Tech: Tauri 2 + React 19 + Rust + SQLite + Ollama, 端口 1420
+- 核心：ReAct 编排循环（意图→选工具→执行→观察→迭代），23 类工具，中文对话界面
+- 管家能力：系统信息、进程、文件扫描/读写、shell 命令（带安全护栏）、打开应用、定时提醒、记忆、桌面通知
+- 自进化：历史经验按意图相关度检索，区分成功经验与失败复盘，越用越懂你
+- 兼容 qwen2.5-coder:7b 等本地小模型的三种工具调用输出格式
+- 状态：v0.2.0 alpha，指令驱动 Agent 已可用，持续扩展工具集与决策能力
 
 ## Git Commit
 `git rev-parse --short HEAD`
