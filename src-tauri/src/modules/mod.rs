@@ -9,6 +9,7 @@ pub mod notification;
 pub mod agent;
 pub mod shell;
 pub mod reminder;
+pub mod chat;
 
 /// 本机 HTTP 客户端：显式禁用系统/环境代理。
 /// reqwest::Client::new() 默认读取 HTTP_PROXY / macOS 系统代理，

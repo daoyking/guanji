@@ -151,7 +151,7 @@ export default function Settings({ isDark, onToggleTheme }: SettingsProps) {
       <section className="bg-white dark:bg-gray-800 rounded-xl p-6 card-shadow">
         <h3 className="text-lg font-medium text-gray-900 dark:text-white mb-4">关于</h3>
         <div className="space-y-2 text-sm text-gray-600 dark:text-gray-400">
-          <p><strong>版本:</strong> 0.4.0-alpha</p>
+          <p><strong>版本:</strong> 0.4.1-alpha</p>
           <p><strong>作者:</strong> jindy</p>
           <p><strong>协议:</strong> MIT License</p>
           <p className="mt-4 pt-4 border-t border-gray-200 dark:border-gray-700">

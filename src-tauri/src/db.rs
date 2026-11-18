@@ -61,6 +61,16 @@ pub fn init_db() -> Result<(), Box<dyn std::error::Error>> {
             created_at TEXT NOT NULL DEFAULT (datetime('now')),
             fired INTEGER NOT NULL DEFAULT 0
         );
+        CREATE TABLE IF NOT EXISTS chat_messages (
+            id TEXT PRIMARY KEY,
+            role TEXT NOT NULL,
+            content TEXT NOT NULL,
+            traces TEXT NOT NULL DEFAULT '[]',
+            steps INTEGER,
+            model TEXT,
+            time TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
         ",
     )?;
     // 幂等 migration：老库的 memories 表可能缺少 tag/summary 列。

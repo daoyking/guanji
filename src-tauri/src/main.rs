@@ -10,15 +10,6 @@ fn main() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_dialog::init())
-        .setup(move |app| {
-            // Initialize SQLite database
-            db::init_db().map_err(|e| e.to_string())?;
-
-            // Apply persisted theme to webview on startup
-            theme::apply_on_startup(app);
-
-            Ok(())
-        })
         .invoke_handler(tauri::generate_handler![
             // System info
             modules::system::get_system_info,
@@ -84,8 +75,20 @@ fn main() {
             modules::reminder::reminder_add,
             modules::reminder::reminder_list,
             modules::reminder::reminder_delete,
+            // AI chat history persistence
+            modules::chat::chat_history,
+            modules::chat::chat_upsert,
+            modules::chat::chat_clear,
         ])
         .setup(|app| {
+            // Initialize SQLite database —— 必须最先执行，所有持久化功能都依赖它。
+            // 注意：Tauri Builder 只保留最后一个 .setup()，多个 setup 会静默覆盖，
+            // 曾因拆成两个 setup 导致 init_db 从未执行、全部 DB 功能失效。
+            db::init_db().map_err(|e| e.to_string())?;
+
+            // Apply persisted theme to webview on startup
+            theme::apply_on_startup(app);
+
             modules::tasks::spawn_task_runner();
             modules::reminder::spawn_reminder_runner(app.handle().clone());
             Ok(())

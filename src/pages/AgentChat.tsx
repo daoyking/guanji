@@ -31,6 +31,15 @@ interface ModelProbe {
   latency_ms: number;
   detail: string;
 }
+interface StoredMessage {
+  id: string;
+  role: string;
+  content: string;
+  traces?: Trace[];
+  steps?: number;
+  model?: string;
+  time: string;
+}
 
 const SUGGESTIONS = [
   '检查所有本地服务的健康状态',
@@ -56,13 +65,11 @@ function now() {
   return new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' });
 }
 
+const WELCOME_CONTENT = '你好，我是管家。直接用中文下达指令——查系统、跑命令、读写文件、打开应用、设定时提醒、记事情，我来判断该调用哪些工具并一步步做完，还会从成败经验里越来越懂你。';
+const welcomeMessage = (): Message => ({ id: 'welcome', role: 'assistant', content: WELCOME_CONTENT, time: now() });
+
 export default function AgentChat() {
-  const [messages, setMessages] = useState<Message[]>([{
-    id: 'welcome',
-    role: 'assistant',
-    content: '你好，我是管家。直接用中文下达指令——查系统、跑命令、读写文件、打开应用、设定时提醒、记事情，我来判断该调用哪些工具并一步步做完，还会从成败经验里越来越懂你。',
-    time: now(),
-  }]);
+  const [messages, setMessages] = useState<Message[]>([welcomeMessage()]);
   const [input, setInput] = useState('');
   const [busy, setBusy] = useState(false);
   const [model, setModel] = useState('加载中…');
@@ -73,9 +80,46 @@ export default function AgentChat() {
   const [modelMsg, setModelMsg] = useState('');
   const bottomRef = useRef<HTMLDivElement>(null);
 
+  // 启动时恢复对话历史
   useEffect(() => {
+    invoke<StoredMessage[]>('chat_history')
+      .then((history) => {
+        const restored: Message[] = history.map((h) => ({
+          id: h.id,
+          role: h.role as MsgRole,
+          content: h.content,
+          traces: h.traces || [],
+          steps: h.steps,
+          model: h.model,
+          time: h.time,
+        }));
+        if (restored.length > 0) setMessages([welcomeMessage(), ...restored]);
+      })
+      .catch((e) => console.error('加载对话历史失败:', e));
     invoke<string>('agent_model_name').then(setModel).catch(() => setModel('未知'));
   }, []);
+
+  // 持久化单条消息（失败只记录日志，不打断对话）
+  const persist = (m: Message) => {
+    invoke('chat_upsert', {
+      msg: {
+        id: m.id, role: m.role, content: m.content,
+        traces: m.traces || [], steps: m.steps ?? null,
+        model: m.model ?? null, time: m.time,
+      },
+    }).catch((e) => console.error('保存对话失败:', e));
+  };
+
+  // 清空对话历史
+  const clearHistory = async () => {
+    if (!window.confirm('确定清空所有对话历史吗？此操作不可恢复。')) return;
+    try {
+      await invoke('chat_clear');
+      setMessages([welcomeMessage()]);
+    } catch (e) {
+      alert(`清空失败：${String(e)}`);
+    }
+  };
 
   // 展开下拉时加载本机模型列表
   const toggleModelPanel = async () => {
@@ -147,7 +191,9 @@ export default function AgentChat() {
           status: p.status as Trace['status'], result: p.result, elapsed_ms: p.elapsed_ms,
         };
         if (idx >= 0) traces[idx] = trace; else traces.push(trace);
-        next[next.length - 1] = { ...last, traces };
+        const updated = { ...last, traces };
+        next[next.length - 1] = updated;
+        persist(updated); // 工具轨迹实时落盘
         return next;
       });
     });
@@ -167,28 +213,27 @@ export default function AgentChat() {
       .map((m) => ({ role: m.role, content: m.content }));
 
     const assistantId = `a-${Date.now()}`;
-    setMessages((prev) => [
-      ...prev,
-      { id: `u-${Date.now()}`, role: 'user', content, time: now() },
-      { id: assistantId, role: 'assistant', content: '', traces: [], time: now() },
-    ]);
+    const userMsg: Message = { id: `u-${Date.now()}`, role: 'user', content, time: now() };
+    const assistantMsg: Message = { id: assistantId, role: 'assistant', content: '', traces: [], time: now() };
+    setMessages((prev) => [...prev, userMsg, assistantMsg]);
+    persist(userMsg);
+    persist(assistantMsg);
 
     try {
       const reply = await invoke<{ answer: string; traces: Trace[]; steps: number; model: string }>('agent_chat', {
         message: content,
         history,
       });
-      setMessages((prev) => prev.map((m) =>
-        m.id === assistantId
-          ? { ...m, content: reply.answer, traces: reply.traces, steps: reply.steps, model: reply.model }
-          : m
-      ));
+      const finalMsg: Message = {
+        ...assistantMsg,
+        content: reply.answer, traces: reply.traces, steps: reply.steps, model: reply.model,
+      };
+      setMessages((prev) => prev.map((m) => m.id === assistantId ? finalMsg : m));
+      persist(finalMsg);
     } catch (e) {
-      setMessages((prev) => prev.map((m) =>
-        m.id === assistantId
-          ? { ...m, content: `⚠️ 执行失败：${String(e)}`, traces: [] }
-          : m
-      ));
+      const failMsg: Message = { ...assistantMsg, content: `⚠️ 执行失败：${String(e)}`, traces: [] };
+      setMessages((prev) => prev.map((m) => m.id === assistantId ? failMsg : m));
+      persist(failMsg);
     } finally {
       setBusy(false);
     }
@@ -206,6 +251,14 @@ export default function AgentChat() {
             指令驱动 · 自主决策 · 越用越懂你
           </p>
         </div>
+        <div className="flex items-center gap-2">
+        {messages.length > 1 && (
+          <button onClick={clearHistory} disabled={busy}
+            className="px-3 py-1.5 text-xs text-gray-500 dark:text-gray-400 border border-gray-200 dark:border-gray-700 rounded-full hover:border-red-400 hover:text-red-500 disabled:opacity-50 transition-colors"
+            title="清空所有对话历史">
+            清空对话
+          </button>
+        )}
         <div className="relative">
           <button onClick={toggleModelPanel} disabled={busy}
             className="flex items-center gap-2 px-3 py-1.5 bg-green-50 dark:bg-green-900/20 hover:bg-green-100 dark:hover:bg-green-900/40 rounded-full transition-colors disabled:opacity-50"
@@ -260,6 +313,7 @@ export default function AgentChat() {
               )}
             </div>
           )}
+        </div>
         </div>
       </div>
 
