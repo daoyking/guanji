@@ -23,6 +23,11 @@ fn main() {
             modules::file::file_get_config,
             modules::file::file_set_scan_dirs,
             modules::file::file_set_ignore_dirs,
+            // Application manager
+            modules::apps::list_installed_apps,
+            modules::apps::launch_app,
+            modules::apps::cleanup_app_data,
+            modules::apps::uninstall_app,
             // Database operations (memories & settings)
             db::list_memories,
             db::add_memory,

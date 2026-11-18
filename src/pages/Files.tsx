@@ -117,8 +117,9 @@ export default function Files() {
 
   const handleCleanTemp = async () => {
     try {
-      const result = await invoke<any>('clean_temp_files');
+      const result = await invoke<{freed_bytes: number; cleaned_count: number; message?: string}>('clean_temp_files');
       setTempStats(result);
+      alert(result?.message || `已清理 ${result.cleaned_count} 项`);
       await loadLargeFiles();
     } catch (e) {
       alert(`清理失败: ${e}`);

@@ -84,8 +84,8 @@ export default function Dashboard() {
 
   const handleCleanTemp = async () => {
     try {
-      const result = await invoke<string>('clean_temp_files');
-      alert(result || '清理完成');
+      const result = await invoke<{ message?: string; freed_bytes?: number; cleaned_count?: number }>('clean_temp_files');
+      alert(result?.message || '清理完成');
       await load();
     } catch (e) {
       alert(`清理失败: ${String(e)}`);

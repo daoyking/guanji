@@ -317,26 +317,50 @@ fn trash_files_to(paths: Vec<String>, trash: &Path) -> TrashResult {
     TrashResult { moved, failed }
 }
 
-/// Clean temp/cache files and report what could be freed
+/// Clean temp/cache files: actually move them to Trash (recoverable).
 #[tauri::command]
 pub async fn clean_temp_files() -> Result<serde_json::Value, String> {
     let mut freed_bytes = 0u64;
-    let dirs_to_scan = vec![
-        ("cache_tencent", dirs::cache_dir().map(|d| d.join("Tencent"))),
-        ("cache_home", dirs::home_dir().map(|d| d.join(".cache"))),
-        ("temp", None),
-    ];
-    for (_label, opt) in dirs_to_scan {
-        if let Some(path) = opt {
-            if path.exists() && path.is_dir() {
-                if let Ok(size) = dir_size(&path) { freed_bytes += size; }
+    let mut cleaned_count = 0usize;
+    let mut fails: Vec<String> = Vec::new();
+
+    // 只针对明确的缓存目录整体处理，避免误伤用户数据
+    let mut targets: Vec<PathBuf> = Vec::new();
+    if let Some(cache) = dirs::cache_dir() {
+        targets.push(cache.join("Tencent"));
+    }
+    if let Some(home) = dirs::home_dir() {
+        targets.push(home.join(".cache"));
+    }
+
+    for path in targets {
+        if !path.exists() || !path.is_dir() {
+            continue;
+        }
+        let size = dir_size(&path).unwrap_or(0);
+        match crate::modules::move_to_trash(&path) {
+            Ok(_) => {
+                freed_bytes += size;
+                cleaned_count += 1;
             }
+            Err(e) => fails.push(format!(
+                "{}: {}",
+                path.file_name().unwrap_or_default().to_string_lossy(),
+                e
+            )),
         }
     }
+
+    let message = format!(
+        "已清理 {} 项缓存，释放约 {:.1} MB（已移到废纸篓，可恢复）{}",
+        cleaned_count,
+        freed_bytes as f64 / 1_000_000.0,
+        if fails.is_empty() { String::new() } else { format!("\n失败 {} 项：{}", fails.len(), fails.join("; ")) }
+    );
     Ok(serde_json::json!({
         "freed_bytes": freed_bytes,
-        "cleaned_count": 0,
-        "message": format!("扫描到 {} MB 可清理的缓存文件（未实际删除，请手动确认）", freed_bytes / 1_000_000)
+        "cleaned_count": cleaned_count,
+        "message": message
     }))
 }
 

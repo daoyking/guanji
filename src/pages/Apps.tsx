@@ -27,12 +27,17 @@ export default function Apps() {
   const [cleanupInfo, setCleanupInfo] = useState<string>('');
   const [showConfirm, setShowConfirm] = useState<{app: AppEntry} | null>(null);
 
+  const [loadError, setLoadError] = useState<string>('');
+
   const loadApps = async () => {
     setLoading(true);
+    setLoadError('');
     try {
       const result = await invoke<AppEntry[]>('list_installed_apps');
       setApps(result);
     } catch (e) {
+      const msg = String(e);
+      setLoadError(msg);
       console.error('Failed to load apps:', e);
     } finally {
       setLoading(false);
@@ -93,8 +98,25 @@ export default function Apps() {
         ))}
       </div>
 
+      {/* Load error */}
+      {loadError && (
+        <div className="bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded-xl p-4 text-sm text-red-700 dark:text-red-300">
+          读取应用列表失败：{loadError}
+        </div>
+      )}
+
       {/* Apps Grid */}
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+        {!loading && !loadError && filtered.length === 0 && (
+          <div className="col-span-full bg-white dark:bg-gray-800 rounded-xl p-10 text-center card-shadow">
+            <p className="text-gray-500 dark:text-gray-400 text-sm">
+              {apps.length === 0 ? '未扫描到应用' : '该分类下没有应用'}
+            </p>
+            <p className="text-xs text-gray-400 mt-2">
+              {apps.length === 0 ? '扫描范围为 /Applications 与 ~/Applications' : '试试切换到「全部」'}
+            </p>
+          </div>
+        )}
         {filtered.map(app => (
           <div key={app.id} className="bg-white dark:bg-gray-800 rounded-xl p-4 card-shadow">
             <div className="flex items-start justify-between">
