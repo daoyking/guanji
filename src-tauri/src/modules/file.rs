@@ -1,6 +1,6 @@
 //! Module for file management (large files, cleanup, duplicates)
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -14,6 +14,118 @@ pub struct FileEntry {
 }
 
 const MB: u64 = 1_000_000u64;
+
+// ─── 用户可配置的扫描目录 / 忽略目录 ─────────────────────────
+
+const KEY_SCAN_DIRS: &str = "file_scan_dirs";
+const KEY_IGNORE_DIRS: &str = "file_ignore_dirs";
+
+/// 默认扫描根目录（用户未配置时使用）
+fn default_scan_dirs() -> Vec<String> {
+    let home = dirs::home_dir().unwrap_or_default();
+    ["Downloads", "Desktop", "Documents", "Videos", "Music"]
+        .iter()
+        .map(|d| home.join(d).to_string_lossy().to_string())
+        .collect()
+}
+
+/// 默认忽略项：按目录名匹配（任意层级），避免扫到代码依赖/版本库/系统库
+fn default_ignore_dirs() -> Vec<String> {
+    vec![
+        "node_modules".into(),
+        ".git".into(),
+        "Library".into(),
+        ".cache".into(),
+    ]
+}
+
+/// 从 settings 读取 JSON 数组；未配置时返回 default
+fn read_list(key: &str, default: Vec<String>) -> Vec<String> {
+    let raw = crate::db::get_setting_inner(key).unwrap_or_default();
+    if raw.trim().is_empty() {
+        return default;
+    }
+    serde_json::from_str::<Vec<String>>(&raw).unwrap_or(default)
+}
+
+fn write_list(key: &str, list: &[String]) -> Result<(), String> {
+    let raw = serde_json::to_string(list).map_err(|e| e.to_string())?;
+    crate::db::with_db(|conn| {
+        conn.execute(
+            "INSERT INTO settings (key, value) VALUES (?1, ?2) \
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            rusqlite::params![key, raw],
+        )?;
+        Ok(())
+    })
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct FileScanConfig {
+    pub scan_dirs: Vec<String>,
+    pub ignore_dirs: Vec<String>,
+}
+
+/// 读取完整配置（扫描目录 + 忽略目录）
+#[tauri::command]
+pub fn file_get_config() -> FileScanConfig {
+    FileScanConfig {
+        scan_dirs: read_list(KEY_SCAN_DIRS, default_scan_dirs()),
+        ignore_dirs: read_list(KEY_IGNORE_DIRS, default_ignore_dirs()),
+    }
+}
+
+#[tauri::command]
+pub fn file_set_scan_dirs(dirs: Vec<String>) -> Result<(), String> {
+    write_list(KEY_SCAN_DIRS, &dirs)
+}
+
+#[tauri::command]
+pub fn file_set_ignore_dirs(dirs: Vec<String>) -> Result<(), String> {
+    write_list(KEY_IGNORE_DIRS, &dirs)
+}
+
+/// 判断某个目录是否应被忽略。
+/// 规则（对每条 ignore 项）：
+/// 1. 含路径分隔符 / 或以 ~ 开头 → 视为路径：规范化后判断是否为该路径本身或其子目录
+/// 2. 否则 → 视为目录名：路径中任一层文件名与之相等即忽略（任意层级）
+fn is_ignored(path: &Path, ignores: &[String]) -> bool {
+    if ignores.is_empty() {
+        return false;
+    }
+    // 目录名逐层比对（一次遍历同时覆盖「名称匹配」）
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    for rule in ignores {
+        let rule = rule.trim();
+        if rule.is_empty() {
+            continue;
+        }
+        if rule.contains('/') || rule.starts_with('~') {
+            // 路径规则：展开 ~ 后做前缀匹配
+            let expanded = expand_tilde(rule);
+            let rule_path = PathBuf::from(&expanded);
+            if path == rule_path || path.starts_with(&rule_path) {
+                return true;
+            }
+        } else if name == rule {
+            // 目录名规则
+            return true;
+        }
+    }
+    false
+}
+
+fn expand_tilde(s: &str) -> String {
+    if s == "~" {
+        return dirs::home_dir().unwrap_or_default().to_string_lossy().to_string();
+    }
+    if let Some(rest) = s.strip_prefix("~/") {
+        if let Some(home) = dirs::home_dir() {
+            return home.join(rest).to_string_lossy().to_string();
+        }
+    }
+    s.to_string()
+}
 
 fn dir_size(path: &Path) -> Result<u64, std::io::Error> {
     let mut size = 0u64;
@@ -31,14 +143,19 @@ fn dir_size(path: &Path) -> Result<u64, std::io::Error> {
     Ok(size)
 }
 
-async fn collect_files(dir: &Path, threshold: u64, results: &mut Vec<FileEntry>) {
+async fn collect_files(dir: &Path, threshold: u64, results: &mut Vec<FileEntry>, ignores: &[String]) {
     if !dir.exists() || !dir.is_dir() { return; }
+    // 入口目录本身若被忽略（例如用户把某个扫描根加入了忽略），直接跳过
+    if is_ignored(dir, ignores) { return; }
     let entries = match fs::read_dir(dir) { Ok(e) => e, Err(_) => return };
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
+            if is_ignored(&path, ignores) {
+                continue;
+            }
             if path.components().count() - dir.components().count() < 3 {
-                Box::pin(collect_files(&path, threshold, results)).await;
+                Box::pin(collect_files(&path, threshold, results, ignores)).await;
             }
         } else if let Ok(meta) = fs::metadata(&path) {
             if meta.len() >= threshold {
@@ -59,8 +176,9 @@ pub async fn scan_downloads(threshold_mb: Option<f64>) -> Result<Vec<FileEntry>,
     let threshold = (threshold_mb.unwrap_or(100.0) * MB as f64) as u64;
     // dirs::download_dir() 已指向 ~/Downloads，切勿再 join("Downloads") 造成嵌套
     let download_dir = dirs::download_dir().ok_or("Cannot find Downloads directory")?;
+    let ignores = read_list(KEY_IGNORE_DIRS, default_ignore_dirs());
     let mut results = Vec::new();
-    collect_files(&download_dir, threshold, &mut results).await;
+    collect_files(&download_dir, threshold, &mut results, &ignores).await;
     results.sort_by(|a, b| b.size_mb.partial_cmp(&a.size_mb).unwrap());
     Ok(results)
 }
@@ -69,17 +187,12 @@ pub async fn scan_downloads(threshold_mb: Option<f64>) -> Result<Vec<FileEntry>,
 #[tauri::command]
 pub async fn list_large_files(threshold_mb: f64, limit: usize) -> Result<Vec<FileEntry>, String> {
     let threshold = (threshold_mb * MB as f64) as u64;
-    let home = dirs::home_dir().ok_or("Cannot find home directory")?;
-    let dirs = vec![
-        home.join("Downloads"),
-        home.join("Desktop"),
-        home.join("Documents"),
-        home.join("Videos"),
-        home.join("Music"),
-    ];
+    let scan_dirs = read_list(KEY_SCAN_DIRS, default_scan_dirs());
+    let ignores = read_list(KEY_IGNORE_DIRS, default_ignore_dirs());
     let mut results = Vec::new();
-    for dir in &dirs {
-        if dir.exists() { collect_files(dir, threshold, &mut results).await; }
+    for dir_str in &scan_dirs {
+        let dir = PathBuf::from(expand_tilde(dir_str));
+        if dir.exists() { collect_files(&dir, threshold, &mut results, &ignores).await; }
     }
     results.sort_by(|a, b| b.size_mb.partial_cmp(&a.size_mb).unwrap());
     results.truncate(limit);
@@ -112,17 +225,19 @@ pub async fn clean_temp_files() -> Result<serde_json::Value, String> {
 /// Find duplicate files by size in given paths
 #[tauri::command]
 pub async fn find_duplicates(paths: Vec<String>) -> Result<Vec<Vec<FileEntry>>, String> {
+    let ignores = read_list(KEY_IGNORE_DIRS, default_ignore_dirs());
     let mut size_map: std::collections::HashMap<u64, Vec<(String, String)>> = std::collections::HashMap::new();
     for path_str in paths {
-        let path = PathBuf::from(&path_str);
+        let path = PathBuf::from(expand_tilde(&path_str));
         if path.exists() && path.is_dir() {
             let mut stack = vec![path.clone()];
             while let Some(current) = stack.pop() {
+                if is_ignored(&current, &ignores) { continue; }
                 if let Ok(entries) = fs::read_dir(&current) {
                     for entry in entries.flatten() {
                         let p = entry.path();
-                        if p.is_dir() { 
-                            if current.components().count() < 5 {
+                        if p.is_dir() {
+                            if !is_ignored(&p, &ignores) && current.components().count() < 5 {
                                 stack.push(p.clone());
                             }
                         } else if let Ok(meta) = fs::metadata(&p) {
@@ -148,4 +263,89 @@ pub async fn find_duplicates(paths: Vec<String>) -> Result<Vec<Vec<FileEntry>>, 
         .collect();
     groups.sort_by(|a, b| b[0].size_mb.partial_cmp(&a[0].size_mb).unwrap());
     Ok(groups)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ignore_by_name_matches_any_level() {
+        let ignores = vec!["node_modules".to_string(), ".git".to_string()];
+        assert!(is_ignored(Path::new("/Users/me/proj/node_modules"), &ignores));
+        assert!(is_ignored(Path::new("/Users/me/a/b/c/.git"), &ignores));
+        assert!(!is_ignored(Path::new("/Users/me/Documents/report.pdf"), &ignores));
+    }
+
+    #[test]
+    fn ignore_by_absolute_path_matches_self_and_children() {
+        let ignores = vec!["/Users/me/Library".to_string()];
+        assert!(is_ignored(Path::new("/Users/me/Library"), &ignores));
+        assert!(is_ignored(Path::new("/Users/me/Library/Caches"), &ignores));
+        assert!(!is_ignored(Path::new("/Users/me/Documents"), &ignores));
+        // 同为 Library 结尾但不同父目录，不应被路径规则命中
+        assert!(!is_ignored(Path::new("/Users/other/Library"), &ignores));
+    }
+
+    #[test]
+    fn empty_ignores_ignore_nothing() {
+        assert!(!is_ignored(Path::new("/anything"), &[]));
+    }
+
+    #[test]
+    fn tilde_rule_uses_home() {
+        let home = dirs::home_dir().unwrap_or_default();
+        let ignores = vec!["~/Pictures".to_string()];
+        let pics = home.join("Pictures");
+        assert!(is_ignored(&pics, &ignores));
+        assert!(is_ignored(&pics.join("sub"), &ignores));
+    }
+}
+
+#[cfg(test)]
+mod integration_tests {
+    use super::*;
+
+    #[test]
+    fn collect_files_respects_ignore_rules() {
+        let root = std::env::temp_dir().join("gj_collect_test");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::create_dir_all(root.join("node_modules")).unwrap();
+        // 造两个超过阈值的文件（阈值设很低，1 byte 即算大文件）
+        fs::write(root.join("src").join("keep.bin"), b"aaaa").unwrap();
+        fs::write(root.join("node_modules").join("skip.bin"), b"bbbbbbbb").unwrap();
+
+        // 不忽略：应拿到 2 个文件
+        let mut r1 = Vec::new();
+        futures_lite_block_on(collect_files(&root, 1, &mut r1, &[]));
+        assert_eq!(r1.len(), 2, "未配置忽略时应扫到 2 个文件");
+
+        // 忽略 node_modules：应只剩 1 个
+        let ignores = vec!["node_modules".to_string()];
+        let mut r2 = Vec::new();
+        futures_lite_block_on(collect_files(&root, 1, &mut r2, &ignores));
+        assert_eq!(r2.len(), 1, "忽略 node_modules 后应只剩 1 个文件");
+        assert!(r2[0].name == "keep.bin");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    // collect_files 是 async 但只用了 await 递归，无真正 I/O 阻塞点；
+    // 这里用一个极简 block_on 驱动，避免引入 tokio 依赖到测试。
+    fn futures_lite_block_on<F: std::future::Future>(fut: F) -> F::Output {
+        use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+        fn noop(_: *const ()) {}
+        fn clone(p: *const ()) -> RawWaker { RawWaker::new(p, &VTABLE) }
+        static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, noop, noop, noop);
+        let waker = unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) };
+        let mut cx = Context::from_waker(&waker);
+        let mut fut = Box::pin(fut);
+        loop {
+            match fut.as_mut().poll(&mut cx) {
+                Poll::Ready(v) => return v,
+                Poll::Pending => std::thread::yield_now(),
+            }
+        }
+    }
 }

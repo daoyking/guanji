@@ -9,6 +9,7 @@ fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_dialog::init())
         .setup(move |app| {
             // Initialize SQLite database
             db::init_db().map_err(|e| e.to_string())?;
@@ -27,6 +28,9 @@ fn main() {
             modules::file::clean_temp_files,
             modules::file::scan_downloads,
             modules::file::find_duplicates,
+            modules::file::file_get_config,
+            modules::file::file_set_scan_dirs,
+            modules::file::file_set_ignore_dirs,
             // Database operations (memories & settings)
             db::list_memories,
             db::add_memory,

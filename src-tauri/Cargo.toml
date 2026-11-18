@@ -1,6 +1,6 @@
 [package]
 name = "guanji"
-version = "0.3.1"
+version = "0.4.0"
 description = "管家 - 你的个人电脑管家"
 authors = ["jindy"]
 edition = "2021"
@@ -23,3 +23,4 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 lazy_static = "1.5"
 tauri-plugin-clipboard-manager = "2.5.0"
 tauri-plugin-notification = "2"
+tauri-plugin-dialog = "2"
