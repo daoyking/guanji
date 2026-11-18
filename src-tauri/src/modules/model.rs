@@ -32,7 +32,7 @@ fn ollama_url() -> String {
 /// List all locally installed Ollama models
 #[tauri::command]
 pub async fn list_ollama_models() -> Result<Vec<OllamaModel>, String> {
-    let client = reqwest::Client::new();
+    let client = crate::modules::local_http_client();
     let url = format!("{}/api/tags", ollama_url());
     match client.get(&url).send().await {
         Ok(res) => {
@@ -53,7 +53,7 @@ pub async fn list_ollama_models() -> Result<Vec<OllamaModel>, String> {
 /// Pull a model by name (e.g. "qwen2.5:7b") — returns last progress line
 #[tauri::command]
 pub async fn pull_ollama_model(name: String) -> Result<String, String> {
-    let client = reqwest::Client::new();
+    let client = crate::modules::local_http_client();
     let url = format!("{}/api/pull", ollama_url());
     let body = serde_json::json!({ "name": name, "stream": false });
     match client.post(&url).json(&body).send().await {
@@ -74,7 +74,7 @@ pub async fn pull_ollama_model(name: String) -> Result<String, String> {
 /// Delete a model by name
 #[tauri::command]
 pub async fn delete_ollama_model(name: String) -> Result<String, String> {
-    let client = reqwest::Client::new();
+    let client = crate::modules::local_http_client();
     let url = format!("{}/api/delete", ollama_url());
     let body = serde_json::json!({ "name": name });
     match client.delete(&url).json(&body).send().await {

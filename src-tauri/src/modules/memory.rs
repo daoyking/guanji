@@ -109,7 +109,7 @@ pub async fn mem_analyze(text: String) -> Result<IntentJson, String> {
         "options": { "temperature": 0.1, "num_predict": 200 }
     });
 
-    let resp = reqwest::Client::new()
+    let resp = crate::modules::local_http_client()
         .post(&url)
         .header("Content-Type", "application/json")
         .timeout(std::time::Duration::from_secs(30))
@@ -154,7 +154,7 @@ async fn embed_text(text: &str) -> Result<Vec<f32>, String> {
         "model": "bge-m3",
         "prompt": text
     });
-    let resp = reqwest::Client::new()
+    let resp = crate::modules::local_http_client()
         .post(&url)
         .header("Content-Type", "application/json")
         .timeout(std::time::Duration::from_secs(10))

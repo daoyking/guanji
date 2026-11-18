@@ -12,6 +12,11 @@ fn ollama_url() -> String {
     std::env::var("OLLAMA_HOST").unwrap_or_else(|_| "http://localhost:11434".to_string())
 }
 
+/// Ollama 是本机服务，用禁用代理的客户端直连（见 modules::local_http_client）。
+fn ollama_http_client() -> reqwest::Client {
+    crate::modules::local_http_client()
+}
+
 const MODEL_PREF_KEY: &str = "agent_model";
 const DEFAULT_MODEL: &str = "qwen2.5-coder:7b";
 
@@ -271,7 +276,7 @@ async fn chat_with_ollama(messages: Vec<Value>) -> Result<Value, String> {
         "stream": false,
         "options": {"temperature": 0.1, "num_predict": 512}
     });
-    let resp = reqwest::Client::new()
+    let resp = ollama_http_client()
         .post(&url)
         .json(&body)
         .timeout(std::time::Duration::from_secs(120))
@@ -636,7 +641,7 @@ async fn probe_model(model: &str) -> ModelProbe {
     let started = std::time::Instant::now();
     let latency = || started.elapsed().as_millis() as u64;
 
-    let resp = match reqwest::Client::new()
+    let resp = match ollama_http_client()
         .post(&url)
         .json(&body)
         .timeout(std::time::Duration::from_secs(60))
@@ -679,7 +684,7 @@ async fn probe_model(model: &str) -> ModelProbe {
 #[tauri::command]
 pub async fn agent_list_models() -> Result<Vec<Value>, String> {
     let url = format!("{}/api/tags", ollama_url());
-    let resp = reqwest::Client::new()
+    let resp = ollama_http_client()
         .get(&url)
         .timeout(std::time::Duration::from_secs(10))
         .send()
