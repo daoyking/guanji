@@ -16,6 +16,7 @@ fn main() {
             modules::system::get_processes,
             // File management
             modules::file::list_large_files,
+            modules::file::trash_files,
             modules::file::clean_temp_files,
             modules::file::scan_downloads,
             modules::file::find_duplicates,

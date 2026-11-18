@@ -7,6 +7,16 @@ interface FileScanConfig {
   ignore_dirs: string[];
 }
 
+interface TrashFailure {
+  path: string;
+  reason: string;
+}
+
+interface TrashResult {
+  moved: string[];
+  failed: TrashFailure[];
+}
+
 export default function Files() {
   const [largeFiles, setLargeFiles] = useState<any[]>([]);
   const [tempStats, setTempStats] = useState<{freed_bytes: number; cleaned_count: number} | null>(null);
@@ -15,6 +25,8 @@ export default function Files() {
   const [configOpen, setConfigOpen] = useState(false);
   const [nameInput, setNameInput] = useState('');
   const [saving, setSaving] = useState(false);
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [deleting, setDeleting] = useState(false);
 
   const loadConfig = async () => {
     try {
@@ -30,6 +42,9 @@ export default function Files() {
     try {
       const files = await invoke<any[]>('list_large_files', { thresholdMb: 50, limit: 20 });
       setLargeFiles(files);
+      // 清掉已不存在文件的选中态
+      const valid = new Set(files.map((f) => f.path));
+      setSelected((prev) => new Set([...prev].filter((p) => valid.has(p))));
     } catch (e) {
       console.error('Failed to load large files:', e);
     } finally {
@@ -107,6 +122,46 @@ export default function Files() {
       await loadLargeFiles();
     } catch (e) {
       alert(`清理失败: ${e}`);
+    }
+  };
+
+  const toggleSelect = (path: string) => {
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(path)) next.delete(path); else next.add(path);
+      return next;
+    });
+  };
+
+  const toggleAll = () => {
+    setSelected((prev) => prev.size === largeFiles.length
+      ? new Set()
+      : new Set(largeFiles.map((f) => f.path)));
+  };
+
+  const selectedMb = largeFiles
+    .filter((f) => selected.has(f.path))
+    .reduce((sum, f) => sum + (f.size_mb || 0), 0);
+
+  const deleteSelected = async () => {
+    const paths = [...selected];
+    if (!paths.length) return;
+    if (!confirm(`确定把选中的 ${paths.length} 个文件（约 ${selectedMb.toFixed(1)} MB）移到废纸篓吗？\n\n文件可从废纸篓恢复，不会永久删除。`)) return;
+
+    setDeleting(true);
+    try {
+      const result = await invoke<TrashResult>('trash_files', { paths });
+      const lines = [`已移到废纸篓：${result.moved.length} 个`];
+      if (result.failed.length) {
+        lines.push(`失败 ${result.failed.length} 个：\n${result.failed.map((f) => `· ${f.path.split('/').pop()}：${f.reason}`).join('\n')}`);
+      }
+      alert(lines.join('\n\n'));
+      setSelected(new Set());
+      await loadLargeFiles();
+    } catch (e) {
+      alert(`删除失败: ${e}`);
+    } finally {
+      setDeleting(false);
     }
   };
 
@@ -245,28 +300,63 @@ export default function Files() {
       </div>
 
       <div id="files-scan" className="bg-white dark:bg-gray-800 rounded-xl p-6 card-shadow">
-        <div className="flex items-center justify-between mb-4">
-          <h3 className="text-lg font-medium text-gray-900 dark:text-white">大文件列表</h3>
-          <button onClick={loadLargeFiles} className="text-sm text-blue-600 hover:text-blue-700">刷新</button>
+        <div className="flex items-center justify-between mb-4 flex-wrap gap-2">
+          <h3 className="text-lg font-medium text-gray-900 dark:text-white">
+            大文件列表
+            {largeFiles.length > 0 && (
+              <span className="ml-2 text-sm font-normal text-gray-400">已选 {selected.size} / {largeFiles.length}</span>
+            )}
+          </h3>
+          <div className="flex items-center gap-4">
+            {largeFiles.length > 0 && (
+              <button onClick={toggleAll} className="text-sm text-blue-600 hover:text-blue-700">
+                {selected.size === largeFiles.length ? '取消全选' : '全选'}
+              </button>
+            )}
+            <button onClick={loadLargeFiles} className="text-sm text-blue-600 hover:text-blue-700">刷新</button>
+          </div>
         </div>
         {loading ? (
           <p className="text-gray-500 text-sm text-center py-8">扫描中...</p>
         ) : largeFiles.length === 0 ? (
           <p className="text-gray-500 text-sm text-center py-8">未发现大文件</p>
         ) : (
-          <div className="space-y-2">
-            {largeFiles.map((file, idx) => (
-              <div key={idx} className="flex items-center justify-between p-3 bg-gray-50 dark:bg-gray-700 rounded-lg">
-                <div className="flex-1 min-w-0">
-                  <p className="text-sm font-medium text-gray-900 dark:text-white truncate">{file.name}</p>
-                  <p className="text-xs text-gray-500 dark:text-gray-400">{file.path}</p>
+          <>
+            <div className="space-y-2">
+              {largeFiles.map((file, idx) => (
+                <div key={idx} className={`flex items-center gap-3 p-3 rounded-lg ${selected.has(file.path) ? 'bg-blue-50 dark:bg-blue-900/20' : 'bg-gray-50 dark:bg-gray-700'}`}>
+                  <input
+                    type="checkbox"
+                    checked={selected.has(file.path)}
+                    onChange={() => toggleSelect(file.path)}
+                    className="w-4 h-4 accent-blue-600 cursor-pointer shrink-0"
+                    title="选择此文件"
+                  />
+                  <div className="flex-1 min-w-0">
+                    <p className="text-sm font-medium text-gray-900 dark:text-white truncate">{file.name}</p>
+                    <p className="text-xs text-gray-500 dark:text-gray-400 truncate">{file.path}</p>
+                  </div>
+                  <span className="px-3 py-1 bg-yellow-100 dark:bg-yellow-900/30 text-yellow-700 dark:text-yellow-400 rounded-full text-sm font-medium shrink-0">
+                    {file.size_mb.toFixed(1)} MB
+                  </span>
                 </div>
-                <span className="ml-4 px-3 py-1 bg-yellow-100 dark:bg-yellow-900/30 text-yellow-700 dark:text-yellow-400 rounded-full text-sm font-medium">
-                  {file.size_mb.toFixed(1)} MB
-                </span>
+              ))}
+            </div>
+            {selected.size > 0 && (
+              <div className="mt-4 flex items-center justify-between pt-4 border-t border-gray-200 dark:border-gray-700">
+                <p className="text-sm text-gray-500 dark:text-gray-400">
+                  已选 {selected.size} 个文件，约 {selectedMb.toFixed(1)} MB
+                </p>
+                <button
+                  onClick={deleteSelected}
+                  disabled={deleting}
+                  className="px-4 py-2 text-sm bg-red-600 text-white rounded-lg hover:bg-red-700 disabled:opacity-50 transition-colors"
+                >
+                  {deleting ? '处理中...' : `移到废纸篓 (${selected.size})`}
+                </button>
               </div>
-            ))}
-          </div>
+            )}
+          </>
         )}
       </div>
     </div>

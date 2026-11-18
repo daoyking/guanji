@@ -199,6 +199,112 @@ pub async fn list_large_files(threshold_mb: f64, limit: usize) -> Result<Vec<Fil
     Ok(results)
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct TrashFailure {
+    pub path: String,
+    pub reason: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct TrashResult {
+    pub moved: Vec<String>,
+    pub failed: Vec<TrashFailure>,
+}
+
+/// 把用户勾选的大文件移到废纸篓（可恢复，绝不永久删除）。
+/// 安全约束：只接受普通文件；拒绝系统关键目录、废纸篓自身内的路径；
+/// 同名文件加时间戳后缀避免覆盖。跨磁盘移动失败时返回明确原因。
+#[tauri::command]
+pub fn trash_files(paths: Vec<String>) -> Result<TrashResult, String> {
+    let home = dirs::home_dir().ok_or("无法定位用户主目录")?;
+    let trash = home.join(".Trash");
+    fs::create_dir_all(&trash).map_err(|e| format!("无法访问废纸篓: {}", e))?;
+    Ok(trash_files_to(paths, &trash))
+}
+
+/// 核心逻辑（trash 路径可注入，便于测试）
+fn trash_files_to(paths: Vec<String>, trash: &Path) -> TrashResult {
+    let trash_canon = trash.canonicalize().unwrap_or_else(|_| trash.to_path_buf());
+
+    // 系统关键目录前缀，一律拒绝。注意不能笼统拒绝 /private——
+    // macOS 的临时目录 canonicalize 后正是 /private/var/folders/...
+    let forbidden = [
+        "/System", "/usr", "/bin", "/sbin", "/Library",
+        "/private/etc", "/private/var/db", "/private/var/root",
+        "/.Trash",
+    ];
+
+    let mut moved = Vec::new();
+    let mut failed = Vec::new();
+
+    for raw in paths {
+        let expanded = expand_tilde(&raw);
+        let path = PathBuf::from(&expanded);
+
+        // 只处理普通文件，目录一律跳过（防止误删整个文件夹）
+        if !path.is_file() {
+            failed.push(TrashFailure {
+                path: raw,
+                reason: "不是普通文件或文件已不存在，已跳过".into(),
+            });
+            continue;
+        }
+
+        let canon = match path.canonicalize() {
+            Ok(c) => c,
+            Err(e) => {
+                failed.push(TrashFailure { path: raw, reason: format!("无法解析路径: {}", e) });
+                continue;
+            }
+        };
+
+        let canon_str = canon.to_string_lossy().to_string();
+        if forbidden.iter().any(|p| canon_str == *p || canon_str.starts_with(&format!("{}/", p))) {
+            failed.push(TrashFailure {
+                path: raw,
+                reason: "系统关键路径，出于安全考虑拒绝删除".into(),
+            });
+            continue;
+        }
+        if canon.starts_with(&trash_canon) {
+            failed.push(TrashFailure {
+                path: raw,
+                reason: "文件已在废纸篓中".into(),
+            });
+            continue;
+        }
+
+        let name = canon.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if name.is_empty() {
+            failed.push(TrashFailure { path: raw, reason: "无法获取文件名".into() });
+            continue;
+        }
+
+        let mut dest = trash.join(name);
+        if dest.exists() {
+            let stamp = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            dest = trash.join(format!("{}.{}", name, stamp));
+        }
+
+        match fs::rename(&canon, &dest) {
+            Ok(_) => moved.push(raw),
+            Err(e) => {
+                let reason = if e.raw_os_error() == Some(18) {
+                    "跨磁盘移动失败，请手动处理".into()
+                } else {
+                    format!("移动失败: {}", e)
+                };
+                failed.push(TrashFailure { path: raw, reason });
+            }
+        }
+    }
+
+    TrashResult { moved, failed }
+}
+
 /// Clean temp/cache files and report what could be freed
 #[tauri::command]
 pub async fn clean_temp_files() -> Result<serde_json::Value, String> {
@@ -347,5 +453,66 @@ mod integration_tests {
                 Poll::Pending => std::thread::yield_now(),
             }
         }
+    }
+
+    #[test]
+    fn trash_moves_file_and_skips_dirs_and_missing() {
+        let root = std::env::temp_dir().join("gj_trash_test");
+        let _ = fs::remove_dir_all(&root);
+        let trash = root.join("trash");
+        let src_dir = root.join("src");
+        fs::create_dir_all(&trash).unwrap();
+        fs::create_dir_all(src_dir.join("subdir")).unwrap();
+        let f1 = src_dir.join("big.bin");
+        fs::write(&f1, b"hello").unwrap();
+
+        let r = trash_files_to(
+            vec![
+                f1.to_string_lossy().to_string(),
+                src_dir.join("subdir").to_string_lossy().to_string(),
+                src_dir.join("missing.bin").to_string_lossy().to_string(),
+            ],
+            &trash,
+        );
+
+        assert_eq!(r.moved.len(), 1, "只有普通文件应被移动");
+        assert_eq!(r.failed.len(), 2, "目录和不存在的文件应被跳过");
+        assert!(trash.join("big.bin").exists(), "文件应出现在废纸篓");
+        assert!(!f1.exists(), "原位置文件应消失");
+        assert!(src_dir.join("subdir").exists(), "目录绝不能被删除");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn trash_handles_name_collision_without_overwrite() {
+        let root = std::env::temp_dir().join("gj_trash_collision");
+        let _ = fs::remove_dir_all(&root);
+        let trash = root.join("trash");
+        let src = root.join("dup.bin");
+        fs::create_dir_all(&trash).unwrap();
+        fs::write(&src, b"new").unwrap();
+        fs::write(trash.join("dup.bin"), b"old").unwrap();
+
+        let r = trash_files_to(vec![src.to_string_lossy().to_string()], &trash);
+        assert_eq!(r.moved.len(), 1);
+        assert_eq!(fs::read(trash.join("dup.bin")).unwrap(), b"old", "已有文件不能被覆盖");
+        let renamed = fs::read_dir(&trash).unwrap().map(|e| e.unwrap().path())
+            .find(|p| p.file_name().unwrap().to_string_lossy().starts_with("dup.bin."))
+            .expect("应生成带后缀的副本");
+        assert_eq!(fs::read(&renamed).unwrap(), b"new");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn trash_rejects_system_paths() {
+        let root = std::env::temp_dir().join("gj_trash_sys");
+        let trash = root.join("trash");
+        fs::create_dir_all(&trash).unwrap();
+        if Path::new("/etc/hosts").exists() {
+            let r = trash_files_to(vec!["/etc/hosts".into()], &trash);
+            assert!(r.failed.iter().any(|f| f.reason.contains("系统关键路径")));
+            assert!(Path::new("/etc/hosts").exists(), "系统文件必须保持原样");
+        }
+        let _ = fs::remove_dir_all(&root);
     }
 }
