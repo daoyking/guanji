@@ -143,8 +143,16 @@ pub async fn run_now(id: String) -> Result<String, String> {
 // ─── Background Runner ──────────────────────────────────────────
 
 pub fn spawn_task_runner() {
-    let handle = tokio::runtime::Handle::current();
-    handle.spawn(async move {
+    // setup() 闭包不在 Tokio runtime 上下文中，Handle::current() 会 panic。
+    // 因此在专用 OS 线程上创建独立的单线程 runtime 来跑后台调度循环。
+    std::thread::Builder::new()
+        .name("task-runner".to_string())
+        .spawn(|| {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("failed to build task runner runtime");
+            rt.block_on(async {
         loop {
             time::sleep(Duration::from_secs(60)).await;
             let now = chrono::Utc::now().to_rfc3339();
@@ -187,5 +195,7 @@ pub fn spawn_task_runner() {
                 run_task_command(tid, cmd);
             }
         }
-    });
+            });
+        })
+        .expect("failed to spawn task runner thread");
 }
