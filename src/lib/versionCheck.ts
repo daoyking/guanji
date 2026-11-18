@@ -3,7 +3,7 @@
  *
  * Configuration (override via window.__GUANJI_CONFIG__ in index.html, or env vars):
  *   - RELEASE_API_URL : GitHub API endpoint for latest release
- *                      default: https://api.github.com/repos/daoyking/GuanJia/releases/latest
+ *                      default: https://api.github.com/repos/daoyking/guanji/releases/latest
  *   - CURRENT_VERSION : hard-coded fallback if package.json is not accessible
  *
  * Usage:
@@ -11,7 +11,7 @@
  */
 
 const DEFAULT_RELEASE_URL =
-  'https://api.github.com/repos/daoyking/GuanJia/releases/latest';
+  'https://api.github.com/repos/daoyking/guanji/releases/latest';
 const CURRENT_VERSION = __APP_VERSION__; // injected by vite.config.ts at build time
 
 export interface UpdateInfo {

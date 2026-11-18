@@ -11,8 +11,29 @@ const MAX_STEPS: usize = 8;
 fn ollama_url() -> String {
     std::env::var("OLLAMA_HOST").unwrap_or_else(|_| "http://localhost:11434".to_string())
 }
+
+const MODEL_PREF_KEY: &str = "agent_model";
+const DEFAULT_MODEL: &str = "qwen2.5-coder:7b";
+
+/// 当前 Agent 使用的模型：优先用户在界面选择的偏好（SQLite），
+/// 其次环境变量，最后默认值。偏好存 SQLite 以便跨重启保持。
 fn agent_model() -> String {
-    std::env::var("GUANJI_AGENT_MODEL").unwrap_or_else(|_| "qwen2.5-coder:7b".to_string())
+    let stored = std::thread::spawn(|| {
+        with_db(|conn| {
+            conn.query_row(
+                "SELECT value FROM settings WHERE key = ?1",
+                rusqlite::params![MODEL_PREF_KEY],
+                |r| r.get::<_, String>(0),
+            )
+        })
+    })
+    .join()
+    .ok()
+    .and_then(|r| r.ok());
+    stored
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| std::env::var("GUANJI_AGENT_MODEL").ok())
+        .unwrap_or_else(|| DEFAULT_MODEL.to_string())
 }
 
 // ─── 对外数据结构 ──────────────────────────────────────────────
@@ -590,6 +611,125 @@ pub async fn agent_chat(app: AppHandle, message: String, history: Option<Vec<Val
 #[tauri::command]
 pub fn agent_model_name() -> String {
     agent_model()
+}
+
+// ─── 模型选择 + 本机可用性验证 ────────────────────────────────
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct ModelProbe {
+    pub model: String,
+    pub ok: bool,
+    pub latency_ms: u64,
+    pub detail: String,
+}
+
+/// 探活：真发一次极简 chat 请求验证模型在本机能否正常工作。
+/// 只查 /api/tags 列表是不够的——模型可能已损坏、正在加载失败、或是 embedding 模型无法对话。
+async fn probe_model(model: &str) -> ModelProbe {
+    let url = format!("{}/api/chat", ollama_url());
+    let body = json!({
+        "model": model,
+        "messages": [{"role": "user", "content": "hi"}],
+        "stream": false,
+        "options": {"num_predict": 1, "temperature": 0}
+    });
+    let started = std::time::Instant::now();
+    let latency = || started.elapsed().as_millis() as u64;
+
+    let resp = match reqwest::Client::new()
+        .post(&url)
+        .json(&body)
+        .timeout(std::time::Duration::from_secs(60))
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => return ModelProbe {
+            model: model.to_string(), ok: false, latency_ms: latency(),
+            detail: format!("无法连接 Ollama：{}（请确认 Ollama 已启动）", e),
+        },
+    };
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        let reason = if status.as_u16() == 404 {
+            "模型不存在或已被删除".to_string()
+        } else {
+            format!("Ollama 返回 HTTP {}", status)
+        };
+        return ModelProbe { model: model.to_string(), ok: false, latency_ms: latency(), detail: reason };
+    }
+    match serde_json::from_str::<Value>(&text) {
+        Ok(v) if v.get("message").is_some() || v.get("response").is_some() => ModelProbe {
+            model: model.to_string(), ok: true, latency_ms: latency(),
+            detail: "可用 · 响应正常".to_string(),
+        },
+        Ok(v) => ModelProbe {
+            model: model.to_string(), ok: false, latency_ms: latency(),
+            detail: format!("响应格式异常：{}", v.to_string().chars().take(80).collect::<String>()),
+        },
+        Err(_) => ModelProbe {
+            model: model.to_string(), ok: false, latency_ms: latency(),
+            detail: "响应解析失败".to_string(),
+        },
+    }
+}
+
+/// 列出本机 Ollama 模型，带大小信息（可用性由前端按需逐个探活，避免并发加载多个大模型）
+#[tauri::command]
+pub async fn agent_list_models() -> Result<Vec<Value>, String> {
+    let url = format!("{}/api/tags", ollama_url());
+    let resp = reqwest::Client::new()
+        .get(&url)
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await
+        .map_err(|e| format!("无法连接 Ollama：{}", e))?;
+    if !resp.status().is_success() {
+        return Err(format!("Ollama HTTP {}", resp.status()));
+    }
+    let body: Value = resp.json().await.map_err(|e| e.to_string())?;
+    let current = agent_model();
+    let models = body.get("models").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+    let out: Vec<Value> = models.into_iter().map(|m| {
+        let name = m["name"].as_str().unwrap_or("").to_string();
+        json!({
+            "name": name,
+            "size": m["size"].as_u64().unwrap_or(0),
+            "current": name == current,
+        })
+    }).collect();
+    Ok(out)
+}
+
+/// 探活单个模型（前端选中时调用，确认能正常使用）
+#[tauri::command]
+pub async fn agent_probe_model(model: String) -> Result<ModelProbe, String> {
+    Ok(probe_model(&model).await)
+}
+
+/// 设置 Agent 模型偏好：先探活，通过才写入 SQLite
+#[tauri::command]
+pub async fn agent_set_model(model: String) -> Result<ModelProbe, String> {
+    let result = probe_model(&model).await;
+    if !result.ok {
+        return Ok(result); // 返回失败原因，前端据此提示且不切换
+    }
+    let pref = model.clone();
+    let saved = std::thread::spawn(move || {
+        with_db(|conn| {
+            conn.execute(
+                "INSERT INTO settings (key, value) VALUES (?1, ?2) \
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                rusqlite::params![MODEL_PREF_KEY, pref],
+            )?;
+            Ok(())
+        })
+    })
+    .join()
+    .map_err(|_| "保存偏好失败".to_string())?;
+    saved.map_err(|e| format!("保存偏好失败：{}", e))?;
+    Ok(result)
 }
 
 #[cfg(test)]

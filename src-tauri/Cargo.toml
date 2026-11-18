@@ -1,6 +1,6 @@
 [package]
 name = "guanji"
-version = "0.2.0"
+version = "0.3.0"
 description = "管家 - 你的个人电脑管家"
 authors = ["jindy"]
 edition = "2021"

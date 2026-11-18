@@ -20,6 +20,17 @@ interface Message {
   model?: string;
   time: string;
 }
+interface LocalModel {
+  name: string;
+  size: number;
+  current: boolean;
+}
+interface ModelProbe {
+  model: string;
+  ok: boolean;
+  latency_ms: number;
+  detail: string;
+}
 
 const SUGGESTIONS = [
   '检查所有本地服务的健康状态',
@@ -55,11 +66,67 @@ export default function AgentChat() {
   const [input, setInput] = useState('');
   const [busy, setBusy] = useState(false);
   const [model, setModel] = useState('加载中…');
+  const [modelOpen, setModelOpen] = useState(false);
+  const [models, setModels] = useState<LocalModel[]>([]);
+  const [probing, setProbing] = useState<string | null>(null);
+  const [probeCache, setProbeCache] = useState<Record<string, ModelProbe>>({});
+  const [modelMsg, setModelMsg] = useState('');
   const bottomRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     invoke<string>('agent_model_name').then(setModel).catch(() => setModel('未知'));
   }, []);
+
+  // 展开下拉时加载本机模型列表
+  const toggleModelPanel = async () => {
+    const next = !modelOpen;
+    setModelOpen(next);
+    setModelMsg('');
+    if (next && models.length === 0) {
+      try {
+        const list = await invoke<LocalModel[]>('agent_list_models');
+        setModels(list);
+        if (list.length === 0) setModelMsg('未检测到本机模型，请确认 Ollama 已启动并已安装模型');
+      } catch (e) {
+        setModelMsg(`加载模型列表失败：${String(e)}`);
+      }
+    }
+  };
+
+  // 探活单个模型（真发请求验证能否使用）
+  const probe = async (name: string): Promise<ModelProbe> => {
+    setProbing(name);
+    try {
+      const result = await invoke<ModelProbe>('agent_probe_model', { model: name });
+      setProbeCache((prev) => ({ ...prev, [name]: result }));
+      return result;
+    } catch (e) {
+      const fail: ModelProbe = { model: name, ok: false, latency_ms: 0, detail: String(e) };
+      setProbeCache((prev) => ({ ...prev, [name]: fail }));
+      return fail;
+    } finally {
+      setProbing(null);
+    }
+  };
+
+  // 选择模型：先探活，通过才切换并持久化
+  const chooseModel = async (name: string) => {
+    if (name === model) return;
+    setModelMsg('正在验证模型可用性…');
+    const result = await probe(name);
+    if (!result.ok) {
+      setModelMsg(`✗ ${name} 不可用：${result.detail}`);
+      return;
+    }
+    try {
+      await invoke<ModelProbe>('agent_set_model', { model: name });
+      setModel(name);
+      setModels((prev) => prev.map((m) => ({ ...m, current: m.name === name })));
+      setModelMsg(`✓ 已切换到 ${name}（${result.latency_ms}ms）`);
+    } catch (e) {
+      setModelMsg(`切换失败：${String(e)}`);
+    }
+  };
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -139,9 +206,60 @@ export default function AgentChat() {
             指令驱动 · 自主决策 · 越用越懂你
           </p>
         </div>
-        <div className="flex items-center gap-2 px-3 py-1.5 bg-green-50 dark:bg-green-900/20 rounded-full">
-          <span className="w-2 h-2 bg-green-500 rounded-full animate-pulse" />
-          <span className="text-xs text-green-700 dark:text-green-400 font-mono">{model}</span>
+        <div className="relative">
+          <button onClick={toggleModelPanel} disabled={busy}
+            className="flex items-center gap-2 px-3 py-1.5 bg-green-50 dark:bg-green-900/20 hover:bg-green-100 dark:hover:bg-green-900/40 rounded-full transition-colors disabled:opacity-50"
+            title="点击选择模型">
+            <span className="w-2 h-2 bg-green-500 rounded-full animate-pulse" />
+            <span className="text-xs text-green-700 dark:text-green-400 font-mono">{model}</span>
+            <span className="text-xs text-green-600 dark:text-green-400">▾</span>
+          </button>
+
+          {modelOpen && (
+            <div className="absolute right-0 top-full mt-2 w-80 z-20 bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-xl shadow-xl p-3">
+              <div className="flex items-center justify-between mb-2">
+                <span className="text-sm font-medium text-gray-800 dark:text-gray-200">选择对话模型</span>
+                <button onClick={() => setModelOpen(false)} className="text-gray-400 hover:text-gray-600 dark:hover:text-gray-200 text-lg leading-none">×</button>
+              </div>
+              <p className="text-[11px] text-gray-400 mb-2">选择时会自动检测模型在本机是否可用</p>
+
+              <div className="space-y-1.5 max-h-64 overflow-y-auto">
+                {models.map((m) => {
+                  const pr = probeCache[m.name];
+                  return (
+                    <div key={m.name} className={`rounded-lg border px-2.5 py-2 ${
+                      m.current ? 'border-green-400 bg-green-50 dark:bg-green-900/20' : 'border-gray-200 dark:border-gray-700'
+                    }`}>
+                      <div className="flex items-center justify-between gap-2">
+                        <button onClick={() => chooseModel(m.name)} disabled={probing !== null || m.current}
+                          className="flex-1 text-left min-w-0 disabled:cursor-default">
+                          <div className="flex items-center gap-1.5">
+                            <span className="text-xs font-mono text-gray-800 dark:text-gray-200 truncate">{m.name}</span>
+                            {m.current && <span className="text-[10px] px-1.5 py-0.5 bg-green-500 text-white rounded-full shrink-0">当前</span>}
+                          </div>
+                          <div className="text-[10px] text-gray-400 mt-0.5">{(m.size / 1e9).toFixed(1)} GB</div>
+                        </button>
+                        <button onClick={() => probe(m.name)} disabled={probing !== null}
+                          className="shrink-0 text-[11px] px-2 py-1 rounded border border-gray-300 dark:border-gray-600 text-gray-600 dark:text-gray-300 hover:border-blue-400 hover:text-blue-600 disabled:opacity-50">
+                          {probing === m.name ? '检测中…' : '检测'}
+                        </button>
+                      </div>
+                      {pr && (
+                        <div className={`mt-1.5 text-[10px] ${pr.ok ? 'text-green-600 dark:text-green-400' : 'text-red-500'} break-all`}>
+                          {pr.ok ? `✓ 可用 · ${pr.latency_ms}ms` : `✗ ${pr.detail}`}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+              {modelMsg && (
+                <div className={`mt-2 text-[11px] ${modelMsg.startsWith('✓') ? 'text-green-600 dark:text-green-400' : modelMsg.startsWith('✗') ? 'text-red-500' : 'text-gray-500'} break-all`}>
+                  {modelMsg}
+                </div>
+              )}
+            </div>
+          )}
         </div>
       </div>
 

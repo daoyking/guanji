@@ -69,6 +69,9 @@ fn main() {
             // AI Agent orchestration (M8)
             modules::agent::agent_chat,
             modules::agent::agent_model_name,
+            modules::agent::agent_list_models,
+            modules::agent::agent_probe_model,
+            modules::agent::agent_set_model,
             // Butler execution tools (M8.1)
             modules::shell::run_command,
             modules::shell::open_target,
