@@ -22,3 +22,4 @@ uuid = { version = "1", features = ["v4", "serde"] }
 rusqlite = { version = "0.31", features = ["bundled"] }
 lazy_static = "1.5"
 tauri-plugin-clipboard-manager = "2.5.0"
+tauri-plugin-notification = "2"

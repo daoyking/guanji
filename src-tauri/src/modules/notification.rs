@@ -4,6 +4,8 @@ use std::sync::Mutex;
 use std::collections::HashMap;
 use uuid::Uuid;
 use chrono::Local;
+use tauri_plugin_notification::NotificationExt;
+use tauri::AppHandle;
 
 /// Notification priority levels
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -85,7 +87,7 @@ fn is_quiet_hours(start: u32, end: u32) -> bool {
 // ─── Commands ────────────────────────────────────────────────
 
 #[tauri::command]
-pub async fn notify_push(title: String, body: String, category: Option<String>, priority: Option<String>) -> Result<String, String> {
+pub async fn notify_push(app: AppHandle, title: String, body: String, category: Option<String>, priority: Option<String>) -> Result<String, String> {
     let cat = category.unwrap_or_else(|| "system".to_string());
     let pri_str = priority.unwrap_or_else(|| "Normal".to_string());
     let prio = match pri_str.as_str() {
@@ -132,6 +134,16 @@ pub async fn notify_push(title: String, body: String, category: Option<String>, 
         let hour = Local::now().format("%Y%m%d%H").to_string();
         let mut counts = get_state().hourly_counts.lock().map_err(|e| e.to_string())?;
         *counts.entry(hour).or_insert(0) += 1;
+    }
+
+    // Show native OS notification
+    if let Err(e) = app.notification()
+        .builder()
+        .title(&title)
+        .body(&body)
+        .show()
+    {
+        eprintln!("Failed to show notification: {}", e);
     }
 
     Ok(id)

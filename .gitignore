@@ -31,3 +31,9 @@ releases/
 .env
 .env.local
 .env.*.local
+
+# Generated
+src-tauri/gen/
+
+# Credentials
+.git-credentials

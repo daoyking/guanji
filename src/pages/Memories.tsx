@@ -74,11 +74,9 @@ export default function Memories() {
     setAnalyzing(true);
     try {
       const result = await invoke<any>('mem_analyze', { text: newContent });
-      // Create memory with AI-assisted data
-      const id = await invoke<number>('mem_add', { content: newContent });
-      // Update tag and summary based on AI analysis
+      // Create memory with AI-assisted data persisted to SQLite
+      const id = await invoke<number>('mem_add', { content: newContent, tag: result.tag, summary: result.summary });
       await loadMemories();
-      setAiSummary(`Tag: ${result.tag || 'N/A'} | Summary: ${result.summary || 'N/A'}`);
     } catch (e) {
       alert(`分析失败: ${String(e)}`);
     } finally {

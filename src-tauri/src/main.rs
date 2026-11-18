@@ -8,6 +8,7 @@ mod theme;
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_notification::init())
         .setup(move |app| {
             // Initialize SQLite database
             db::init_db().map_err(|e| e.to_string())?;

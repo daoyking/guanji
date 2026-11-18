@@ -71,13 +71,13 @@ pub async fn mem_list() -> Result<Vec<MemoryItem>, String> {
 }
 
 #[tauri::command]
-pub async fn mem_add(content: String) -> Result<i64, String> {
+pub async fn mem_add(content: String, tag: Option<String>, summary: Option<String>) -> Result<i64, String> {
     tokio::task::spawn_blocking(move || {
         let ts = chrono::Utc::now().to_rfc3339();
         with_db(move |conn| {
             let id = conn.execute(
-                "INSERT INTO memories (content, created_at) VALUES (?1, ?2)",
-                rusqlite::params![&content, &ts],
+                "INSERT INTO memories (content, created_at, tag, summary) VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![&content, &ts, &tag, &summary],
             )?;
             Ok(id as i64)
         })
