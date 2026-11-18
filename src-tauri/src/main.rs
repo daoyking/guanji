@@ -66,6 +66,9 @@ fn main() {
             modules::notification::notify_mark_read,
             modules::notification::notify_get_prefs,
             modules::notification::notify_set_prefs,
+            // AI Agent orchestration (M8)
+            modules::agent::agent_chat,
+            modules::agent::agent_model_name,
         ])
         .setup(|_app| {
             modules::tasks::spawn_task_runner();

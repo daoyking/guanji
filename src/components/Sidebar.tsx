@@ -4,6 +4,7 @@ interface SidebarProps {
 }
 
 const navItems = [
+  { id: 'agent', label: 'AI 管家', icon: '✨', featured: true },
   { id: 'dashboard', label: '概览', icon: '📊' },
   { id: 'files', label: '文件管家', icon: '📂' },
   { id: 'processes', label: '进程管家', icon: '⚙️' },
@@ -28,19 +29,26 @@ export default function Sidebar({ currentPage, onPageChange }: SidebarProps) {
 
       {/* Navigation */}
       <nav className="flex-1 px-3 py-4 space-y-1">
-        {navItems.map((item) => (
-          <button
-            key={item.id}
-            onClick={() => onPageChange(item.id)}
-            className={`flex w-full items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium transition-colors ${
-              currentPage === item.id
-                ? 'bg-blue-50 dark:bg-blue-900/20 text-blue-600 dark:text-blue-400'
-                : 'text-gray-600 dark:text-gray-400 hover:bg-gray-50 dark:hover:bg-gray-700'
-            }`}
-          >
-            <span className="text-lg">{item.icon}</span>
-            {item.label}
-          </button>
+        {navItems.map((item, idx) => (
+          <div key={item.id}>
+            {'featured' in item && item.featured && idx > 0 && (
+              <div className="my-2 border-t border-gray-200 dark:border-gray-700" />
+            )}
+            <button
+              onClick={() => onPageChange(item.id)}
+              className={`flex w-full items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium transition-colors ${
+                currentPage === item.id
+                  ? 'bg-blue-50 dark:bg-blue-900/20 text-blue-600 dark:text-blue-400'
+                  : 'text-gray-600 dark:text-gray-400 hover:bg-gray-50 dark:hover:bg-gray-700'
+              } ${'featured' in item && item.featured ? 'ring-1 ring-blue-200 dark:ring-blue-800' : ''}`}
+            >
+              <span className="text-lg">{item.icon}</span>
+              {item.label}
+              {'featured' in item && item.featured && (
+                <span className="ml-auto text-[9px] px-1.5 py-0.5 rounded bg-blue-100 dark:bg-blue-900/40 text-blue-600 dark:text-blue-400">NEW</span>
+              )}
+            </button>
+          </div>
         ))}
       </nav>
 

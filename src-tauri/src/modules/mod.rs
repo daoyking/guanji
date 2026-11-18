@@ -6,3 +6,4 @@ pub mod service;
 pub mod clipboard;
 pub mod memory;
 pub mod notification;
+pub mod agent;
