@@ -3,8 +3,9 @@
 //! 自主进化：历史执行轨迹作为 few-shot 注入 system prompt，越用越懂你。
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
+use std::collections::HashMap;
 use tauri::{AppHandle, Emitter, Manager, State};
 use crate::db::with_db;
 use crate::modules::provider::{self, Provider, LOCAL_PROVIDER_ID};
@@ -12,16 +13,17 @@ use crate::modules::provider::{self, Provider, LOCAL_PROVIDER_ID};
 const MAX_STEPS: usize = 8;
 
 /// Agent 运行时控制状态：取消标志 + 破坏性操作确认桥接。
+/// 确认用 HashMap 按 id 存储：多工具并行时可能有多个待确认操作，单槽会互相覆盖。
 pub struct AgentControl {
     cancelled: AtomicBool,
-    confirm_tx: Mutex<Option<tokio::sync::oneshot::Sender<bool>>>,
+    confirm_tx: Mutex<HashMap<String, tokio::sync::oneshot::Sender<bool>>>,
 }
 
 impl Default for AgentControl {
     fn default() -> Self {
         Self {
             cancelled: AtomicBool::new(false),
-            confirm_tx: Mutex::new(None),
+            confirm_tx: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -33,6 +35,11 @@ impl AgentControl {
     fn is_cancelled(&self) -> bool { self.cancelled.load(Ordering::SeqCst) }
 }
 
+static CONFIRM_SEQ: AtomicU64 = AtomicU64::new(0);
+fn next_confirm_id() -> String {
+    format!("cfm-{}", CONFIRM_SEQ.fetch_add(1, Ordering::SeqCst))
+}
+
 /// 前端点击「停止」：置取消标志，循环在下一个检查点退出。
 #[tauri::command]
 pub fn agent_cancel(ctrl: State<'_, AgentControl>) -> Result<(), String> {
@@ -40,10 +47,10 @@ pub fn agent_cancel(ctrl: State<'_, AgentControl>) -> Result<(), String> {
     Ok(())
 }
 
-/// 前端确认/拒绝破坏性操作：把结果送回正在等待的 execute_tool。
+/// 前端确认/拒绝破坏性操作：按 id 把结果送回对应的 execute_tool。
 #[tauri::command]
-pub fn agent_confirm(approved: bool, ctrl: State<'_, AgentControl>) -> Result<(), String> {
-    if let Some(tx) = ctrl.confirm_tx.lock().unwrap().take() {
+pub fn agent_confirm(id: String, approved: bool, ctrl: State<'_, AgentControl>) -> Result<(), String> {
+    if let Some(tx) = ctrl.confirm_tx.lock().unwrap().remove(&id) {
         let _ = tx.send(approved);
     }
     Ok(())
@@ -51,13 +58,14 @@ pub fn agent_confirm(approved: bool, ctrl: State<'_, AgentControl>) -> Result<()
 
 /// 请求用户确认一个破坏性操作：发事件 + 等待前端应答（60s 超时，默认拒绝）。
 async fn request_confirm(app: &AppHandle, description: String) -> bool {
+    let id = next_confirm_id();
     let (tx, rx) = tokio::sync::oneshot::channel();
     if let Some(ctrl) = app.try_state::<AgentControl>() {
-        *ctrl.confirm_tx.lock().unwrap() = Some(tx);
+        ctrl.confirm_tx.lock().unwrap().insert(id.clone(), tx);
     } else {
         return false; // 无 state 时安全拒绝
     }
-    let _ = app.emit("agent://confirm", json!({"description": description}));
+    let _ = app.emit("agent://confirm", json!({"id": id, "description": description}));
     match tokio::time::timeout(std::time::Duration::from_secs(60), rx).await {
         Ok(Ok(approved)) => approved,
         _ => false, // 超时或前端断开 → 默认拒绝
@@ -136,6 +144,8 @@ fn resolve_provider(provider_id: &str) -> Result<Provider, String> {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct ToolTrace {
     pub step: usize,
+    /// 同一 step 内并行调用的序号，用于区分多个工具
+    pub call_id: Option<usize>,
     pub tool: String,
     pub args: Value,
     pub result: String,
@@ -550,68 +560,92 @@ fn normalize_tool_calls(calls: Option<&Vec<Value>>, openai_style: bool) -> Vec<V
     out
 }
 
-/// 兼容三种工具调用输出，统一解析为 (tool_name, args) 或最终答案
-fn parse_model_output(content: &str, native_calls: Option<&Vec<Value>>) -> Result<(Option<String>, Value, Option<String>), String> {
-    // 1) 原生 tool_calls
+/// 一个被解析出的工具调用。id 仅原生调用有，用于云模型 role:tool 回填。
+#[derive(Clone, Debug)]
+struct ParsedCall {
+    id: Option<String>,
+    name: String,
+    args: Value,
+}
+
+/// 批量解析模型输出，返回 (工具调用列表, 最终答案)。
+/// 支持四种输出：原生多个 tool_calls / 文本多个 JSON 对象 / JSON 数组 / ReAct 单调用。
+fn parse_model_calls(content: &str, native_calls: Option<&Vec<Value>>) -> Result<(Vec<ParsedCall>, Option<String>), String> {
+    // 1) 原生 tool_calls —— 全部解析，不再只取第一个
     if let Some(calls) = native_calls {
-        if let Some(first) = calls.first() {
-            let f = &first["function"];
+        let parsed: Vec<ParsedCall> = calls.iter().filter_map(|c| {
+            let f = &c["function"];
             let name = f["name"].as_str().unwrap_or("").to_string();
-            let args = f["arguments"].clone();
-            if !name.is_empty() {
-                return Ok((Some(name), args, None));
-            }
+            if name.is_empty() { return None; }
+            Some(ParsedCall {
+                id: c["id"].as_str().filter(|s| !s.is_empty()).map(String::from),
+                name,
+                args: f["arguments"].clone(),
+            })
+        }).collect();
+        if !parsed.is_empty() {
+            return Ok((parsed, None));
         }
     }
 
     let text = content.trim();
-    // 2) 剥离 markdown 代码块
+
+    // 2) ReAct 文本格式（放在 JSON 之前，避免 Action Input 里的对象被误判为工具调用）
+    if let Some(name) = extract_after(text, "Action:") {
+        let args = extract_after(text, "Action Input:")
+            .and_then(|s| serde_json::from_str::<Value>(s.trim()).ok())
+            .unwrap_or_else(|| json!({}));
+        return Ok((vec![ParsedCall { id: None, name: name.trim().to_string(), args }], None));
+    }
+
+    // 3) 文本里的所有顶层 JSON 对象（自动展开顶层数组元素）
     let cleaned = text
         .trim_start_matches("```json")
         .trim_start_matches("```")
         .trim_end_matches("```")
         .trim();
-
-    // 3) 从文本中提取第一个 JSON 对象（容忍模型前后加解释文字）
-    let json_candidate = if cleaned.starts_with('{') {
-        find_first_json_object(cleaned)
-    } else {
-        find_first_json_object(text)
-    };
-
-    if let Some(obj_str) = json_candidate {
-        if let Ok(v) = serde_json::from_str::<Value>(&obj_str) {
-            if let Some(ans) = v.get("answer").and_then(|x| x.as_str()) {
-                return Ok((None, json!({}), Some(ans.to_string())));
+    let mut calls: Vec<ParsedCall> = Vec::new();
+    let mut answer: Option<String> = None;
+    for obj_str in find_json_objects(cleaned) {
+        let v: Value = match serde_json::from_str(&obj_str) { Ok(v) => v, Err(_) => continue };
+        let items: Vec<Value> = if let Some(arr) = v.as_array() { arr.clone() } else { vec![v] };
+        for item in items {
+            if let Some(ans) = item.get("answer").and_then(|x| x.as_str()) {
+                answer = Some(ans.to_string());
+                continue;
             }
-            if let Some(name) = v.get("name").or_else(|| v.get("tool")).and_then(|x| x.as_str()) {
-                let args = v.get("arguments").or_else(|| v.get("args")).cloned().unwrap_or_else(|| json!({}));
-                return Ok((Some(name.to_string()), args, None));
+            if let Some(name) = item.get("name").or_else(|| item.get("tool")).and_then(|x| x.as_str()) {
+                let args = item.get("arguments").or_else(|| item.get("args")).cloned().unwrap_or_else(|| json!({}));
+                calls.push(ParsedCall { id: None, name: name.to_string(), args });
+                continue;
             }
-            // 3b) 字典式调用：{"mem_add": {"content": ...}} —— 本地小模型常见变体
-            if let Some(obj) = v.as_object() {
+            // 字典式调用：{"mem_add": {"content": ...}} —— 本地小模型常见变体
+            if let Some(obj) = item.as_object() {
                 if obj.len() == 1 {
                     if let Some((k, val)) = obj.iter().next() {
-                        // 排除 answer/final/thought 等语义键，只把「值为对象」的单键当工具名
                         if !matches!(k.as_str(), "answer" | "final" | "thought" | "result") && val.is_object() {
-                            return Ok((Some(k.clone()), val.clone(), None));
+                            calls.push(ParsedCall { id: None, name: k.clone(), args: val.clone() });
                         }
                     }
                 }
             }
         }
     }
-
-    // 4) ReAct 文本格式：Action: xxx / Action Input: {...}
-    if let Some(name) = extract_after(text, "Action:") {
-        let args = extract_after(text, "Action Input:")
-            .and_then(|s| serde_json::from_str::<Value>(s.trim()).ok())
-            .unwrap_or_else(|| json!({}));
-        return Ok((Some(name.trim().to_string()), args, None));
+    // 4) 都没有 → 整段文本当作最终答案
+    if calls.is_empty() && answer.is_none() {
+        answer = Some(text.to_string());
     }
+    // 同时出现时都返回，由调用方优先消费 calls（模型通常不会混用，但保留信息更稳健）
+    Ok((calls, answer))
+}
 
-    // 5) 都不匹配 → 整段文本当作最终答案
-    Ok((None, json!({}), Some(text.to_string())))
+/// 单调用兼容包装（供现有调用方与单测使用）。
+fn parse_model_output(content: &str, native_calls: Option<&Vec<Value>>) -> Result<(Option<String>, Value, Option<String>), String> {
+    let (calls, answer) = parse_model_calls(content, native_calls)?;
+    match calls.into_iter().next() {
+        Some(c) => Ok((Some(c.name), c.args, None)),
+        None => Ok((None, json!({}), answer)),
+    }
 }
 
 fn find_first_json_object(s: &str) -> Option<String> {
@@ -636,6 +670,41 @@ fn find_first_json_object(s: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// 提取字符串中所有「顶层」JSON 对象（容忍前后解释文字、嵌套对象不重复提取）。
+/// 用于一次解析模型返回的多个工具调用。
+fn find_json_objects(s: &str) -> Vec<String> {
+    let bytes = s.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] != b'{' { i += 1; continue; }
+        let start = i;
+        let mut depth = 0i32;
+        let mut in_string = false;
+        let mut escape = false;
+        let mut end = None;
+        while i < bytes.len() {
+            let c = bytes[i] as char;
+            if escape { escape = false; }
+            else if c == '\\' && in_string { escape = true; }
+            else if c == '"' { in_string = !in_string; }
+            else if !in_string {
+                if c == '{' { depth += 1; }
+                else if c == '}' {
+                    depth -= 1;
+                    if depth == 0 { end = Some(i); break; }
+                }
+            }
+            i += 1;
+        }
+        match end {
+            Some(e) => { out.push(s[start..=e].to_string()); i = e + 1; }
+            None => break, // 未闭合，后面无需再找
+        }
+    }
+    out
 }
 
 fn extract_after<'a>(text: &'a str, marker: &str) -> Option<&'a str> {
@@ -808,6 +877,19 @@ fn save_experience(intent: &str, traces: &[ToolTrace], success: bool) {
 
 // ─── 主入口 ────────────────────────────────────────────────────
 
+/// 把一批工具结果合并成一条 user 消息文本（本地 Ollama / 文本调用模式）。
+fn format_results_as_text(results: &[(String, bool, String)]) -> String {
+    if results.len() == 1 {
+        let (name, ok, r) = &results[0];
+        return format!("[工具结果] 工具 {} 执行{}：{}", name, if *ok {"成功"} else {"失败"}, r);
+    }
+    let mut s = format!("[工具结果] 本次并行执行了 {} 个工具：\n", results.len());
+    for (i, (name, ok, r)) in results.iter().enumerate() {
+        s.push_str(&format!("{}. {} — {}：{}\n", i + 1, name, if *ok {"成功"} else {"失败"}, r));
+    }
+    s
+}
+
 #[tauri::command]
 pub async fn agent_chat(app: AppHandle, message: String, history: Option<Vec<Value>>) -> Result<AgentReply, String> {
     // 对话开始时读取一次模型引用，整轮迭代复用，避免每步 spawn 线程读 SQLite。
@@ -842,10 +924,10 @@ pub async fn agent_chat(app: AppHandle, message: String, history: Option<Vec<Val
         let content = resp["content"].as_str().unwrap_or("").to_string();
         let native = resp["tool_calls"].as_array().cloned();
 
-        let (tool_name, args, answer) = parse_model_output(&content, native.as_ref())?;
+        let (calls, answer) = parse_model_calls(&content, native.as_ref())?;
 
-        // 模型直接给出答案 → 结束
-        if tool_name.is_none() {
+        // 没有工具调用 → 结束（answer 缺失时用整段文本兜底）
+        if calls.is_empty() {
             let answer = answer.unwrap_or_else(|| content.clone());
             // 推送完成事件
             let _ = app.emit("agent://done", json!({"answer": answer, "steps": step}));
@@ -860,90 +942,126 @@ pub async fn agent_chat(app: AppHandle, message: String, history: Option<Vec<Val
             });
         }
 
-        let name = tool_name.unwrap();
+        let batch_size = calls.len();
         let is_local = parse_model_ref(&model_ref).0 == LOCAL_PROVIDER_ID;
 
         // 记录模型本轮的 assistant 消息——让模型在后续迭代里能看到自己调用过什么工具。
-        // 原生 tool_calls 时带上 tool_calls 字段，才能与后面的 role:tool 正确配对。
-        let executed_call_id: Option<String> = if let Some(calls) = native.as_ref() {
-            calls.first().and_then(|c| c["id"].as_str().map(String::from))
-        } else { None };
-        if let Some(calls) = native.as_ref() {
-            // 只保留实际执行的第一个工具调用，保证 assistant.tool_calls 与 tool 结果一一对应。
-            // OpenAI 协议要求 function.arguments 为 JSON 字符串（本地 Ollama 接受对象）。
+        // 原生 tool_calls 时带上全部调用（不再只留第一个），才能与后面的 role:tool 一一配对。
+        if let Some(native_calls) = native.as_ref() {
             let mut assistant_msg = json!({"role": "assistant", "content": content});
-            if let Some(first) = calls.first() {
+            let tc_array: Vec<Value> = native_calls.iter().map(|c| {
                 if is_local {
-                    assistant_msg["tool_calls"] = json!([first]);
+                    c.clone()
                 } else {
-                    let name = first["function"]["name"].as_str().unwrap_or("");
-                    let args_val = &first["function"]["arguments"];
+                    // OpenAI 协议要求 function.arguments 为 JSON 字符串
+                    let name = c["function"]["name"].as_str().unwrap_or("");
+                    let args_val = &c["function"]["arguments"];
                     let args_str = if args_val.is_string() {
                         args_val.as_str().unwrap_or("{}").to_string()
                     } else {
                         args_val.to_string()
                     };
-                    assistant_msg["tool_calls"] = json!([{
-                        "id": first["id"].as_str().unwrap_or("call_0"),
+                    json!({
+                        "id": c["id"].as_str().unwrap_or("call_0"),
                         "type": "function",
                         "function": {"name": name, "arguments": args_str}
-                    }]);
+                    })
                 }
-            }
+            }).collect();
+            assistant_msg["tool_calls"] = json!(tc_array);
             messages.push(assistant_msg);
         } else {
             messages.push(json!({"role": "assistant", "content": content}));
         }
 
-        let _ = app.emit("agent://step", json!({
-            "step": step, "tool": name, "args": args, "status": "running"
-        }));
+        // ── 并发执行全部工具调用 ──
+        // JoinSet 要求 future 为 Send + 'static，因此克隆所需数据进 task；
+        // 返回 (idx, ...) 以便按原始顺序回填结果与 traces。
+        let mut set = tokio::task::JoinSet::new();
+        for (idx, call) in calls.iter().enumerate() {
+            let _ = app.emit("agent://step", json!({
+                "step": step, "call_id": idx, "batch_total": batch_size,
+                "tool": call.name, "args": call.args, "status": "running"
+            }));
+            let app2 = app.clone();
+            let name = call.name.clone();
+            let args = call.args.clone();
+            set.spawn(async move {
+                let started = std::time::Instant::now();
+                let result = execute_tool(&app2, &name, &args).await;
+                (idx, name, args, result, started.elapsed().as_millis() as u64)
+            });
+        }
 
-        let started = std::time::Instant::now();
-        let result = execute_tool(&app, &name, &args).await;
-        let elapsed_ms = started.elapsed().as_millis() as u64;
-        let (result_str, ok) = match result {
-            Ok(v) => (v, true),
-            Err(e) => (e, false),
-        };
-        // 截断过长的工具输出，避免撑爆上下文（按字符，避免中文 UTF-8 越界 panic）
-        let (result_short, _) = crate::modules::truncate_chars(&result_str, 3000);
+        let mut outcomes: Vec<Option<(usize, String, Value, Result<String, String>, u64)>> = vec![None; batch_size];
+        while let Some(joined) = set.join_next().await {
+            match joined {
+                Ok(v) => {
+                    let idx = v.0;
+                    if idx < outcomes.len() { outcomes[idx] = Some(v); }
+                }
+                Err(e) => eprintln!("[agent] 工具 task 异常: {}", e),
+            }
+        }
+        // 用户可能在工具执行期间点了停止：本批结果照常回填，下一步循环边界统一收口
+        if app.try_state::<AgentControl>().map(|c| c.is_cancelled()).unwrap_or(false) {
+            let _ = app.emit("agent://cancelled", json!({"steps": step - 1}));
+            return Ok(AgentReply { answer: "已停止执行。".to_string(), traces, steps: step - 1, model: display_model });
+        }
 
-        traces.push(ToolTrace {
-            step,
-            tool: name.clone(),
-            args: args.clone(),
-            result: result_short.clone(),
-            ok,
-        });
-        let _ = app.emit("agent://step", json!({
-            "step": step, "tool": name, "args": args,
-            "status": if ok { "done" } else { "error" },
-            "result": result_short, "elapsed_ms": elapsed_ms
-        }));
+        // ── 按原顺序回填结果 / traces ──
+        let mut local_results: Vec<(String, bool, String)> = Vec::new();
+        for outcome in outcomes.into_iter().enumerate().filter_map(|(pos, o)| o.map(|v| (pos, v))) {
+            let (seq, (_, name, args, result, elapsed_ms)) = outcome;
+            let (result_str, ok) = match result {
+                Ok(v) => (v, true),
+                Err(e) => (e, false),
+            };
+            // 截断过长的工具输出，避免撑爆上下文（按字符，避免中文 UTF-8 越界 panic）
+            let (result_short, _) = crate::modules::truncate_chars(&result_str, 3000);
 
-        // 工具结果回填：
-        // - 云模型 + 原生 tool_calls → role:tool + tool_call_id（OpenAI 规范，避免语义污染）
-        // - 本地 Ollama / 文本工具调用 → user 文本标记（Ollama 与文本调用模式实测兼容）
+            traces.push(ToolTrace {
+                step,
+                call_id: Some(seq),
+                tool: name.clone(),
+                args: args.clone(),
+                result: result_short.clone(),
+                ok,
+            });
+            let _ = app.emit("agent://step", json!({
+                "step": step, "call_id": seq, "batch_total": batch_size,
+                "tool": name, "args": args,
+                "status": if ok { "done" } else { "error" },
+                "result": result_short, "elapsed_ms": elapsed_ms
+            }));
+            local_results.push((name, ok, result_short));
+        }
+
+        // 云模型 + 原生 tool_calls → 每条结果一个 role:tool + tool_call_id（OpenAI 规范）
+        // 本地 Ollama / 文本调用 → 合并成一条 user 文本标记（实测兼容）
         if !is_local {
-            if let Some(call_id) = executed_call_id {
-                messages.push(json!({
-                    "role": "tool",
-                    "tool_call_id": call_id,
-                    "content": result_short
-                }));
+            let native_ids: Vec<String> = native.as_ref().map(|cs| cs.iter().map(|c| {
+                c["id"].as_str().unwrap_or("call_0").to_string()
+            }).collect()).unwrap_or_default();
+            let use_role_tool = !native_ids.is_empty() && native_ids.len() == local_results.len();
+            if use_role_tool {
+                for (cid, (name, ok, result_short)) in native_ids.iter().zip(local_results.iter()) {
+                    messages.push(json!({
+                        "role": "tool",
+                        "tool_call_id": cid,
+                        "content": format!("工具 {} 执行{}：{}", name, if *ok {"成功"} else {"失败"}, result_short)
+                    }));
+                }
             } else {
-                // 云模型以纯文本输出工具调用（无原生 call id）：无 assistant.tool_calls 可配对，
-                // 只能用 user 文本回填，否则 OpenAI 协议会因孤立 tool 消息返回 400。
                 messages.push(json!({
                     "role": "user",
-                    "content": format!("[工具结果] 工具 {} 执行{}：{}", name, if ok {"成功"} else {"失败"}, result_short)
+                    "content": format_results_as_text(&local_results)
                 }));
             }
         } else {
             messages.push(json!({
                 "role": "user",
-                "content": format!("[工具结果] 工具 {} 执行{}：{}", name, if ok {"成功"} else {"失败"}, result_short)
+                "content": format_results_as_text(&local_results)
             }));
         }
     }
@@ -1123,6 +1241,73 @@ pub async fn agent_set_model(model: String) -> Result<ModelProbe, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn format_multiple_results_includes_all_tools() {
+        let results = vec![
+            ("get_system_info".to_string(), true, "ok1".to_string()),
+            ("list_processes".to_string(), false, "err2".to_string()),
+            ("mem_list".to_string(), true, "ok3".to_string()),
+        ];
+        let text = format_results_as_text(&results);
+        assert!(text.contains("3 个工具"));
+        assert!(text.contains("1. get_system_info — 成功：ok1"));
+        assert!(text.contains("2. list_processes — 失败：err2"));
+        assert!(text.contains("3. mem_list — 成功：ok3"));
+    }
+
+    #[test]
+    fn parse_multiple_native_tool_calls() {
+        let calls = vec![
+            json!({"id": "call_1", "function": {"name": "get_system_info", "arguments": {}}}),
+            json!({"id": "call_2", "function": {"name": "list_processes", "arguments": {"limit": 5}}}),
+            json!({"id": "call_3", "function": {"name": "mem_search", "arguments": {"query": "x"}}}),
+        ];
+        let (parsed, answer) = parse_model_calls("", Some(&calls)).unwrap();
+        assert_eq!(parsed.len(), 3);
+        assert_eq!(parsed[0].name, "get_system_info");
+        assert_eq!(parsed[0].id.as_deref(), Some("call_1"));
+        assert_eq!(parsed[1].name, "list_processes");
+        assert_eq!(parsed[1].args["limit"], 5);
+        assert_eq!(parsed[2].id.as_deref(), Some("call_3"));
+        assert!(answer.is_none());
+    }
+
+    #[test]
+    fn parse_multiple_text_tool_calls() {
+        let text = r#"我先并行查一下系统和进程。
+{"name": "get_system_info", "arguments": {}}
+然后查进程：
+{"name": "list_processes", "arguments": {"limit": 8}}
+"#;
+        let (parsed, answer) = parse_model_calls(text, None).unwrap();
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].name, "get_system_info");
+        assert_eq!(parsed[1].name, "list_processes");
+        assert_eq!(parsed[1].args["limit"], 8);
+        assert!(answer.is_none());
+    }
+
+    #[test]
+    fn parse_json_array_tool_calls() {
+        let text = r#"[{"name":"mem_list","arguments":{}},{"name":"list_tasks","arguments":{}}]"#;
+        let (parsed, answer) = parse_model_calls(text, None).unwrap();
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].name, "mem_list");
+        assert_eq!(parsed[1].name, "list_tasks");
+        assert!(answer.is_none());
+    }
+
+    #[test]
+    fn find_json_objects_skips_nested_and_keeps_top_level() {
+        let text = r#"{"name":"mem_add","arguments":{"content":"嵌套{\"a\":1}","tag":"t"}} 后面 {"answer":"完成"}"#;
+        let objs = find_json_objects(text);
+        assert_eq!(objs.len(), 2, "只取两个顶层对象，嵌套的 arguments 不应被拆出");
+        let (calls, answer) = parse_model_calls(text, None).unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "mem_add");
+        assert_eq!(answer.as_deref(), Some("完成"));
+    }
 
     #[test]
     fn parse_native_tool_call() {

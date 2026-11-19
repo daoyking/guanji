@@ -5,11 +5,13 @@ import { listen } from '@tauri-apps/api/event';
 type MsgRole = 'user' | 'assistant' | 'system';
 interface Trace {
   step: number;
+  call_id?: string;   // 同一 step 内并行调用的序号，用于区分多个工具
   tool: string;
   args: Record<string, unknown>;
   result?: string;
   status: 'running' | 'done' | 'error';
   elapsed_ms?: number;
+  batch_total?: number;
 }
 interface Message {
   id: string;
@@ -188,12 +190,15 @@ export default function AgentChat() {
         const last = next[next.length - 1];
         if (!last || last.role !== 'assistant') return prev;
         const traces = [...(last.traces || [])];
-        const idx = traces.findIndex((t) => t.step === p.step);
+        // 并行调用时同一 step 有多个工具，用 step + call_id 复合键定位
+        const idx = traces.findIndex((t) => t.step === p.step && (t.call_id || '') === (p.call_id || ''));
         const trace: Trace = {
-          step: p.step, tool: p.tool, args: p.args || {},
+          step: p.step, call_id: p.call_id, tool: p.tool, args: p.args || {},
           status: p.status as Trace['status'], result: p.result, elapsed_ms: p.elapsed_ms,
+          batch_total: p.batch_total,
         };
         if (idx >= 0) traces[idx] = trace; else traces.push(trace);
+        traces.sort((a, b) => a.step - b.step || (a.call_id || '').localeCompare(b.call_id || ''));
         const updated = { ...last, traces };
         next[next.length - 1] = updated;
         persist(updated); // 工具轨迹实时落盘
@@ -221,9 +226,10 @@ export default function AgentChat() {
 
   // 破坏性操作二次确认
   useEffect(() => {
-    const unlisten = listen<{ description: string }>('agent://confirm', async (event) => {
+    const unlisten = listen<{ id: string; description: string }>('agent://confirm', async (event) => {
+      // window.confirm 是同步阻塞的，多个并行确认会依次弹出，id 保证回传到正确的等待者
       const approved = window.confirm(`管家请求执行以下操作：\n\n${event.payload.description}\n\n是否允许？`);
-      try { await invoke('agent_confirm', { approved }); }
+      try { await invoke('agent_confirm', { id: event.payload.id, approved }); }
       catch (e) { console.error('确认回传失败:', e); }
     });
     return () => { unlisten.then((f) => f()); };
@@ -382,9 +388,9 @@ export default function AgentChat() {
               {m.traces && m.traces.length > 0 && (
                 <div className="mb-3 space-y-1.5">
                   {m.traces.map((t) => (
-                    <div key={t.step} className="flex items-start gap-2 text-xs bg-gray-50 dark:bg-gray-900/50 rounded-lg px-2.5 py-2">
+                    <div key={`${t.step}-${t.call_id || ''}`} className="flex items-start gap-2 text-xs bg-gray-50 dark:bg-gray-900/50 rounded-lg px-2.5 py-2">
                       <span className="shrink-0 w-5 h-5 rounded-full bg-blue-100 dark:bg-blue-900/40 text-blue-600 dark:text-blue-400 flex items-center justify-center font-mono">
-                        {t.step}
+                        {t.batch_total && t.batch_total > 1 ? `${t.step}·${Number(t.call_id || '0') + 1}` : t.step}
                       </span>
                       <div className="min-w-0 flex-1">
                         <div className="flex items-center gap-2">

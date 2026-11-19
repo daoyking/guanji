@@ -1,4 +1,4 @@
-# 管家 (GuanJia) v0.9.0-alpha
+# 管家 (GuanJia) v0.10.0-alpha
 
 一句话指令驱动的本机全能 AI Agent。
 - Tech: Tauri 2 + React 19 + Rust + SQLite + Ollama, 端口 1420
@@ -7,8 +7,9 @@
 - 自进化：历史经验按意图相关度检索，区分成功经验与失败复盘，越用越懂你
 - 兼容 qwen2.5-coder:7b 等本地小模型的三种工具调用输出格式
 - 模型：界面自选 Ollama 模型，切换前真发请求探活（拒绝不可用/embedding 模型），偏好持久化跨重启
-- 状态：v0.9.0 alpha，指令驱动 Agent + 本机/云模型自选(OpenAI 兼容) + 文件管家自定义忽略目录与多选删除 + 应用管家 + 进程终止建议 + 对话历史持久化已可用
+- 状态：v0.10.0 alpha，指令驱动 Agent + 本机/云模型自选(OpenAI 兼容) + 文件管家自定义忽略目录与多选删除 + 应用管家 + 进程终止建议 + 对话历史持久化已可用
 - v0.9.0 稳定性：流式输出（Ollama NDJSON / OpenAI SSE）+ 停止按钮；破坏性操作二次确认；危险命令黑名单绕过防护；UTF-8 安全截断；语义搜索 embedding 端点修复；API Key 脱敏；云请求 429/5xx 指数退避
+- v0.10.0 多工具并行：模型一次返回多个工具调用时并发执行（JoinSet），按序回填；确认桥接改多槽 id 匹配；轨迹按 step+call_id 区分并行任务
 
 ## Git Commit
 `git rev-parse --short HEAD`
