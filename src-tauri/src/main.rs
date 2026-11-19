@@ -14,6 +14,7 @@ fn main() {
             // System info
             modules::system::get_system_info,
             modules::system::get_processes,
+            modules::system::kill_process,
             // File management
             modules::file::list_large_files,
             modules::file::trash_files,
