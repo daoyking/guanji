@@ -178,7 +178,8 @@ fn tools_schema() -> Vec<Value> {
         tool("find_duplicates", "在指定路径查找重复文件", json!({
             "paths": {"type":"array","items":{"type":"string"},"description":"要检查的目录路径数组"}
         })),
-        tool("clean_temp_files", "清理系统临时文件（谨慎使用，会删除临时文件）", json!({})),
+        tool("clean_memory", "整理系统内存：回收 inactive 缓存页释放内存，不会删除任何文件，无需确认直接执行", json!({})),
+        tool("clean_temp_files", "清理磁盘上的系统临时文件（会删除文件，需用户确认）", json!({})),
         tool("list_services", "列出本地服务及其健康状态（Ollama、OrcaRouter、Chroma、SearXNG）", json!({})),
         tool("probe_service", "探测单个服务的健康状态", json!({
             "service_id": {"type":"string","description":"服务ID：ollama/orcarouter/chroma/searxng"}
@@ -385,10 +386,13 @@ fn system_prompt(successes: &[String], failures: &[String]) -> String {
 - 用户要「打开某个应用/文件/网页」时，用 open_target。
 - 用户要「读某个文件/写点什么/生成脚本」时，用 read_file / write_file。
 - 用户要「定闹钟/提醒我 X 分钟后」时，用 set_reminder。
+- 用户要「清理内存 / 整理内存」时，用 clean_memory：它不删文件、无不可逆损失，会自动执行，直接调用即可，不要问用户。
+- 用户要「清理缓存 / 清理磁盘 / 删除临时文件」时，用 clean_temp_files 或删除类命令：这会删文件，可能弹出确认框，由用户决定是否执行。
 - 需要真正执行系统操作时用 run_command（危险命令会被自动拦截，可放心尝试）。
 - 文件删除、清理类操作前先扫描确认，再执行，并在回答中说清楚做了什么。
-- **工具返回「已清理/已移到废纸篓/已删除」表示操作已经完成，绝不能再让用户手动确认或重复删除。直接用一句话报告实际释放量和结果即可。**
-- 工具返回「用户取消了」时，如实告知用户操作被取消，不要编造「已完成」。
+- **只能报告工具返回结果里真实存在的数字。例如 clean_memory 返回的 freeing_mb/freed_mb 是多少就说多少；工具没返回内存或磁盘数字，就绝不能自己编造「释放了 XXX MB 内存 / XXX MB 磁盘」。宁可只说「已整理完成」，也不可虚构数据。**
+- **工具返回「已清理/已移到废纸篓/已删除/已整理」表示操作已经完成，绝不能再让用户手动确认或重复删除。直接用一句话报告实际结果即可。**
+- 工具返回「用户取消了」时，如实告知用户操作被取消，不要编造「已完成」；若某项清理需确认而用户尚未确认，如实说明「该项需要你确认后才会执行」，不要假装已经删掉。
 - 任务完成后，如果结果重要，用 notify 工具告知用户。
 - 回答用中文，简洁、直接、有条理。"#,
         tools = serde_json::to_string_pretty(&tools_schema()).unwrap_or_default(),
@@ -745,12 +749,12 @@ fn extract_after<'a>(text: &'a str, marker: &str) -> Option<&'a str> {
 
 // ─── 工具执行分发 ──────────────────────────────────────────────
 
-/// 自动执行策略：ask=全部确认（默认），safe=可恢复操作自动、危险操作确认，all=全部自动
+/// 自动执行策略：ask=全部确认，safe=内存整理自动/磁盘与危险操作确认，all=全部自动
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum AutoMode { Ask, Safe, All }
 
 fn auto_mode() -> AutoMode {
-    // 默认 safe：清理类操作移到废纸篓可恢复，无需每次确认；危险命令/写入仍确认
+    // 默认 safe：内存整理无不可逆数据损失，直接执行；磁盘删除与命令/写入仍需确认
     match crate::db::get_setting_inner("agent_auto_mode").unwrap_or_default().as_str() {
         "ask" => AutoMode::Ask,
         "all" => AutoMode::All,
@@ -758,50 +762,36 @@ fn auto_mode() -> AutoMode {
     }
 }
 
-/// 清理自动执行阈值（MB）。0 表示不启用阈值，safe 档下可恢复操作直接放行。
-fn auto_clean_threshold_mb() -> f64 {
-    crate::db::get_setting_inner("agent_auto_threshold_mb")
-        .ok()
-        .and_then(|s| s.trim().parse::<f64>().ok())
-        .filter(|v| *v >= 0.0)
-        .unwrap_or(0.0)
-}
-
-/// 判断一个工具在执行前是否需要弹窗确认。
-/// 把策略判断抽成纯函数以便单测；estimated_mb 为 clean_temp_files 的预估释放量。
-fn needs_confirm(mode: AutoMode, name: &str, threshold_mb: f64, estimated_mb: f64) -> bool {
+/// 判断一个工具在执行前是否需要弹窗确认。纯函数便于单测。
+///
+/// 按「资源类型」区分（取代旧的大小阈值策略）：
+/// - `clean_memory`（内存整理）：只回收 inactive 缓存页，无不可逆数据损失 → safe 档直接放行
+/// - `clean_temp_files`（磁盘）/ `run_command` / `write_file` / `delete_reminder`：safe 档仍需确认
+/// - `ask` 档全部确认；`all` 档全部自动
+fn needs_confirm(mode: AutoMode, name: &str) -> bool {
     if mode == AutoMode::All { return false; }
-    // clean_temp_files 移到废纸篓可恢复，safe 档默认自动；设置阈值后仅小额自动
-    if name == "clean_temp_files" && mode == AutoMode::Safe {
-        return threshold_mb > 0.0 && estimated_mb > threshold_mb;
-    }
+    if mode == AutoMode::Safe && name == "clean_memory" { return false; }
     true
 }
 
 async fn execute_tool(app: &AppHandle, name: &str, args: &Value) -> Result<String, String> {
     // ── 破坏性操作二次确认（human-in-the-loop）──
-    // 这些工具会改变用户系统状态，执行前必须由用户明确同意。
-    // 可在设置里切换自动执行策略（ask / safe / all）。
+    // 这些工具会改变用户系统状态，执行前按策略决定是否由用户明确同意。
+    // 内存整理（clean_memory）无不可逆损失 → safe 档自动放行；磁盘删除/命令/写入仍需确认。
     let mode = auto_mode();
-    let threshold_mb = auto_clean_threshold_mb();
-    // 仅当策略可能放行清理时才预扫描大小（避免每次无谓的目录遍历）
-    let estimated_mb = if name == "clean_temp_files" && mode == AutoMode::Safe && threshold_mb > 0.0 {
-        crate::modules::file::estimate_temp_cache_bytes() as f64 / 1_000_000.0
-    } else {
-        0.0
-    };
     let confirm_desc = match name {
         "run_command" => Some(format!("执行命令：{}", args["command"].as_str().unwrap_or(""))),
         "write_file" => Some(format!("写入文件：{}（{}）",
             args["path"].as_str().unwrap_or(""),
             if args["append"].as_bool().unwrap_or(false) { "追加" } else { "覆盖" })),
         "delete_reminder" => Some(format!("删除提醒 #{}", args["id"].as_i64().unwrap_or(-1))),
-        "clean_temp_files" => Some("清理系统临时文件".to_string()),
+        "clean_temp_files" => Some("清理系统临时文件（磁盘删除）".to_string()),
+        "clean_memory" => Some("整理系统内存".to_string()),
         _ => None,
     };
     if let Some(desc) = confirm_desc {
-        // 无需确认的工具（自动放行）不进入等待，避免每次都弹窗
-        if needs_confirm(mode, name, threshold_mb, estimated_mb) && !request_confirm(app, desc).await {
+        // needs_confirm 为 false 时短路，不进入等待，避免无谓弹窗
+        if needs_confirm(mode, name) && !request_confirm(app, desc).await {
             return Err("用户取消了此操作".to_string());
         }
     }
@@ -833,6 +823,10 @@ async fn execute_tool(app: &AppHandle, name: &str, args: &Value) -> Result<Strin
                 .unwrap_or_else(|| vec![dirs::download_dir().unwrap_or_default().to_string_lossy().to_string()]);
             let groups = crate::modules::file::find_duplicates(paths).await?;
             Ok(json!(groups).to_string())
+        }
+        "clean_memory" => {
+            let res = crate::modules::system::clean_memory().await?;
+            Ok(res.to_string())
         }
         "clean_temp_files" => {
             let res = crate::modules::file::clean_temp_files().await?;
@@ -1554,19 +1548,20 @@ mod tests {
 
     #[test]
     fn auto_mode_respects_confirmation_policies() {
-        // ask：全部确认
-        assert!(needs_confirm(AutoMode::Ask, "clean_temp_files", 0.0, 1.0));
-        assert!(needs_confirm(AutoMode::Ask, "run_command", 0.0, 0.0));
+        // ask：全部确认，包括内存整理
+        assert!(needs_confirm(AutoMode::Ask, "clean_memory"));
+        assert!(needs_confirm(AutoMode::Ask, "clean_temp_files"));
+        assert!(needs_confirm(AutoMode::Ask, "run_command"));
         // all：全部自动
-        assert!(!needs_confirm(AutoMode::All, "run_command", 0.0, 0.0));
-        assert!(!needs_confirm(AutoMode::All, "clean_temp_files", 500.0, 9999.0));
-        // safe：可恢复的清理自动，危险操作仍确认
-        assert!(!needs_confirm(AutoMode::Safe, "clean_temp_files", 0.0, 9999.0));
-        assert!(needs_confirm(AutoMode::Safe, "run_command", 0.0, 0.0));
-        assert!(needs_confirm(AutoMode::Safe, "write_file", 0.0, 0.0));
-        // safe + 阈值：低于阈值自动，超过则确认
-        assert!(!needs_confirm(AutoMode::Safe, "clean_temp_files", 500.0, 120.0));
-        assert!(needs_confirm(AutoMode::Safe, "clean_temp_files", 500.0, 800.0));
+        assert!(!needs_confirm(AutoMode::All, "run_command"));
+        assert!(!needs_confirm(AutoMode::All, "clean_temp_files"));
+        assert!(!needs_confirm(AutoMode::All, "clean_memory"));
+        // safe（默认）：内存整理自动放行，磁盘删除与危险操作仍需确认
+        assert!(!needs_confirm(AutoMode::Safe, "clean_memory"));
+        assert!(needs_confirm(AutoMode::Safe, "clean_temp_files"));
+        assert!(needs_confirm(AutoMode::Safe, "run_command"));
+        assert!(needs_confirm(AutoMode::Safe, "write_file"));
+        assert!(needs_confirm(AutoMode::Safe, "delete_reminder"));
     }
 
     #[test]

@@ -215,6 +215,68 @@ pub fn get_cpu_info() -> Result<CpuInfo, String> {
     })
 }
 
+/// 依据当前可用内存计算内存整理的分配块大小（字节）。
+/// 取可用内存的 60%，上限 2 GiB，避免触发 swap 或 OOM；可用内存过低时返回 0 不执行。
+/// 纯函数，便于单测。
+pub fn memory_purge_chunk_size(available_bytes: u64) -> usize {
+    const MAX_CHUNK: u64 = 2 * 1024 * 1024 * 1024; // 2 GiB 上限
+    const MIN_AVAILABLE: u64 = 256 * 1024 * 1024;  // 可用 < 256 MiB 不整理
+    if available_bytes < MIN_AVAILABLE { return 0; }
+    let target = (available_bytes as f64 * 0.6) as u64;
+    target.min(MAX_CHUNK) as usize
+}
+
+/// 整理系统内存：通过分配并逐页触碰一块受限内存，促使 macOS 内核回收 inactive 缓存页，
+/// 随后释放。不会删除任何文件、不会终止任何进程。返回整理前后的可用内存与净释放量。
+///
+/// 注意：释放量为实测差值，可能为 0（系统无可回收缓存），如实上报，绝不编造。
+#[tauri::command]
+pub async fn clean_memory() -> Result<serde_json::Value, String> {
+    tokio::task::spawn_blocking(|| {
+        let mut sys = sysinfo::System::new();
+        sys.refresh_memory();
+        let before = sys.available_memory();
+
+        let chunk = memory_purge_chunk_size(before);
+        if chunk == 0 {
+            return Ok(serde_json::json!({
+                "message": "可用内存不足，未执行内存整理",
+                "freed_mb": 0u64,
+                "before_mb": before / (1024 * 1024),
+                "after_mb": before / (1024 * 1024),
+                "skipped": true,
+            }));
+        }
+
+        // 分配并逐页触碰（4 KiB/页），迫使内核回收干净页；black_box 防止编译器优化掉写入
+        let mut buf: Vec<u8> = vec![0u8; chunk];
+        let page = 4096usize;
+        let mut i = 0usize;
+        while i < buf.len() {
+            buf[i] = 1;
+            std::hint::black_box(&buf[i]);
+            i += page;
+        }
+        // 释放分配的内存
+        drop(buf);
+
+        sys.refresh_memory();
+        let after = sys.available_memory();
+        let freed = after.saturating_sub(before);
+        let mb = 1024u64 * 1024u64;
+        Ok(serde_json::json!({
+            "message": format!("已整理内存：可用 {} MB → {} MB，释放约 {} MB",
+                before / mb, after / mb, freed / mb),
+            "freed_mb": freed / mb,
+            "before_mb": before / mb,
+            "after_mb": after / mb,
+            "skipped": false,
+        }))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 /// Get memory info
 #[tauri::command]
 pub fn get_memory_info() -> Result<MemoryInfo, String> {
@@ -309,6 +371,17 @@ mod tests {
     use super::*;
 
     const SELF: u32 = 99999;
+
+    #[test]
+    fn memory_purge_chunk_is_bounded() {
+        let mb = 1024u64 * 1024u64;
+        // 可用内存过低时不整理
+        assert_eq!(memory_purge_chunk_size(100 * mb), 0);
+        // 正常取 60%
+        assert_eq!(memory_purge_chunk_size(1000 * mb), (600 * mb) as usize);
+        // 上限 2 GiB
+        assert_eq!(memory_purge_chunk_size(10 * 1024 * mb), (2 * 1024 * mb) as usize);
+    }
 
     #[test]
     fn self_process_is_dangerous() {

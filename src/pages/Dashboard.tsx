@@ -92,6 +92,16 @@ export default function Dashboard() {
     }
   };
 
+  const handleCleanMemory = async () => {
+    try {
+      const result = await invoke<{ message?: string; skipped?: boolean }>('clean_memory');
+      alert(result?.message || '内存整理完成');
+      await load();
+    } catch (e) {
+      alert(`整理失败: ${String(e)}`);
+    }
+  };
+
   const navigateTo = (hash: string) => {
     window.location.hash = hash;
   };
@@ -264,6 +274,13 @@ export default function Dashboard() {
       <div className="bg-white dark:bg-gray-800 rounded-xl p-6 card-shadow">
         <h3 className="text-lg font-medium text-gray-900 dark:text-white mb-4">快速操作</h3>
         <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+          <button
+            onClick={handleCleanMemory}
+            className="flex flex-col items-center gap-2 p-4 bg-gradient-to-br from-gray-50 to-gray-100 dark:from-gray-700 dark:to-gray-800 rounded-xl hover:from-purple-50 hover:to-purple-100 dark:hover:from-purple-900/20 dark:hover:to-purple-800/20 transition-all hover:shadow-md group"
+          >
+            <span className="text-2xl group-hover:scale-110 transition-transform">⚡</span>
+            <span className="text-sm text-gray-700 dark:text-gray-300 font-medium">整理内存</span>
+          </button>
           <button
             onClick={handleCleanTemp}
             className="flex flex-col items-center gap-2 p-4 bg-gradient-to-br from-gray-50 to-gray-100 dark:from-gray-700 dark:to-gray-800 rounded-xl hover:from-blue-50 hover:to-blue-100 dark:hover:from-blue-900/20 dark:hover:to-blue-800/20 transition-all hover:shadow-md group"

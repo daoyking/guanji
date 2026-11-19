@@ -18,7 +18,6 @@ export default function Settings({ isDark, onToggleTheme }: SettingsProps) {
   const [autoStart, setAutoStart] = useState(false);
   const [notifPermission, setNotifPermission] = useState<'unauthorized' | 'authorized'>('unauthorized');
   const [autoMode, setAutoMode] = useState<'ask' | 'safe' | 'all'>('safe');
-  const [cleanThreshold, setCleanThreshold] = useState('0');
   const [autoMsg, setAutoMsg] = useState('');
 
   useEffect(() => {
@@ -29,12 +28,8 @@ export default function Settings({ isDark, onToggleTheme }: SettingsProps) {
 
   const loadAutoSettings = async () => {
     try {
-      const [mode, threshold] = await Promise.all([
-        invoke<string>('get_setting', { key: 'agent_auto_mode' }),
-        invoke<string>('get_setting', { key: 'agent_auto_threshold_mb' }),
-      ]);
+      const mode = await invoke<string>('get_setting', { key: 'agent_auto_mode' });
       if (mode === 'safe' || mode === 'all' || mode === 'ask') setAutoMode(mode);
-      if (threshold) setCleanThreshold(threshold);
     } catch { /* 首次运行无配置，保持默认 */ }
   };
 
@@ -42,13 +37,6 @@ export default function Settings({ isDark, onToggleTheme }: SettingsProps) {
     setAutoMode(mode);
     await invoke('set_setting', { key: 'agent_auto_mode', value: mode });
     setAutoMsg('已保存，下次对话立即生效');
-  };
-
-  const saveThreshold = async () => {
-    const v = Number(cleanThreshold);
-    if (!Number.isFinite(v) || v < 0) { setAutoMsg('请输入有效的非负数字'); return; }
-    await invoke('set_setting', { key: 'agent_auto_threshold_mb', value: String(v) });
-    setAutoMsg(`已保存：清理释放量 ≤ ${v} MB 时自动执行（0 为不启用阈值）`);
   };
 
   const loadMemories = async () => {
@@ -149,12 +137,13 @@ export default function Settings({ isDark, onToggleTheme }: SettingsProps) {
       <section className="bg-white dark:bg-gray-800 rounded-xl p-6 card-shadow">
         <h3 className="text-lg font-medium text-gray-900 dark:text-white mb-2">Agent 自动执行</h3>
         <p className="text-sm text-gray-500 dark:text-gray-400 mb-4">
-          控制 Agent 调用工具时是否需要你手动确认。清理类操作都是移到废纸篓，可随时恢复。
+          按操作类型决定是否弹窗确认：<span className="font-medium text-green-600 dark:text-green-400">内存整理直接执行</span>（不删文件、可恢复），
+          <span className="font-medium text-orange-600 dark:text-orange-400">磁盘清理/删除仍需你确认</span>。
         </p>
         <div className="space-y-3">
           {([
-            { key: 'ask', label: '每次都确认', desc: '所有删除/命令/写入操作都弹窗确认，最保守' },
-            { key: 'safe', label: '自动执行安全操作（默认）', desc: '清理缓存等可恢复操作直接执行；命令/写入仍需确认' },
+            { key: 'ask', label: '每次都确认', desc: '所有删除/命令/写入/内存整理操作都弹窗确认，最保守' },
+            { key: 'safe', label: '内存自动、磁盘确认（默认）', desc: '内存整理直接执行；清理磁盘文件、执行命令、写入文件仍需确认' },
             { key: 'all', label: '信任模式：全部自动', desc: '所有工具调用不再询问，适合完全信任本机环境' },
           ] as const).map((opt) => (
             <button
@@ -173,27 +162,6 @@ export default function Settings({ isDark, onToggleTheme }: SettingsProps) {
               <p className="mt-1 ml-6 text-sm text-gray-500 dark:text-gray-400">{opt.desc}</p>
             </button>
           ))}
-          <div className="pt-2 border-t border-gray-100 dark:border-gray-700">
-            <label className="block text-sm text-gray-600 dark:text-gray-300 mb-2">
-              清理自动执行阈值（MB）
-              <span className="text-gray-400 dark:text-gray-500"> — 仅「安全」档生效，0 表示不启用</span>
-            </label>
-            <div className="flex gap-2">
-              <input
-                type="number"
-                min="0"
-                value={cleanThreshold}
-                onChange={e => setCleanThreshold(e.target.value)}
-                className="flex-1 px-3 py-2 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-white"
-              />
-              <button onClick={saveThreshold} className="px-4 py-2 bg-blue-600 text-white rounded-lg text-sm hover:bg-blue-700">
-                保存
-              </button>
-            </div>
-            <p className="mt-1 text-xs text-gray-400 dark:text-gray-500">
-              设置后，预估释放量不超过该值的清理自动执行；超过则仍弹窗确认。
-            </p>
-          </div>
           {autoMsg && <p className="text-sm text-green-600 dark:text-green-400">{autoMsg}</p>}
         </div>
       </section>
