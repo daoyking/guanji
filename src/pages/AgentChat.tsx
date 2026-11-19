@@ -203,6 +203,46 @@ export default function AgentChat() {
     return () => { unlistenStep.then((f) => f()); };
   }, []);
 
+  // 流式增量文本：实时写入当前助手消息
+  useEffect(() => {
+    const unlisten = listen<{ text: string }>('agent://delta', (event) => {
+      const text = event.payload.text;
+      // 流式期间把文本写进最后一条 assistant 消息，实现逐字显示
+      setMessages((prev) => {
+        const last = prev[prev.length - 1];
+        if (!last || last.role !== 'assistant') return prev;
+        const next = [...prev];
+        next[next.length - 1] = { ...last, content: text };
+        return next;
+      });
+    });
+    return () => { unlisten.then((f) => f()); };
+  }, []);
+
+  // 破坏性操作二次确认
+  useEffect(() => {
+    const unlisten = listen<{ description: string }>('agent://confirm', async (event) => {
+      const approved = window.confirm(`管家请求执行以下操作：\n\n${event.payload.description}\n\n是否允许？`);
+      try { await invoke('agent_confirm', { approved }); }
+      catch (e) { console.error('确认回传失败:', e); }
+    });
+    return () => { unlisten.then((f) => f()); };
+  }, []);
+
+  // 用户停止执行
+  useEffect(() => {
+    const unlisten = listen('agent://cancelled', () => {
+      // 取消事件已由后端返回「已停止执行」答案覆盖当前消息
+    });
+    return () => { unlisten.then((f) => f()); };
+  }, []);
+
+  // 停止执行
+  const stop = async () => {
+    try { await invoke('agent_cancel'); }
+    catch (e) { console.error('停止失败:', e); }
+  };
+
   const send = async (text?: string) => {
     const content = (text ?? input).trim();
     if (!content || busy) return;
@@ -412,10 +452,17 @@ export default function AgentChat() {
             disabled={busy}
             className="flex-1 px-4 py-3 rounded-xl border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 text-gray-900 dark:text-white placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:opacity-50"
           />
-          <button onClick={() => send()} disabled={busy || !input.trim()}
-            className="px-6 py-3 rounded-xl bg-blue-600 hover:bg-blue-700 text-white font-medium disabled:opacity-40 transition-colors">
-            {busy ? '执行中' : '发送'}
-          </button>
+          {busy ? (
+            <button onClick={stop}
+              className="px-6 py-3 rounded-xl bg-red-500 hover:bg-red-600 text-white font-medium transition-colors">
+              停止
+            </button>
+          ) : (
+            <button onClick={() => send()} disabled={!input.trim()}
+              className="px-6 py-3 rounded-xl bg-blue-600 hover:bg-blue-700 text-white font-medium disabled:opacity-40 transition-colors">
+              发送
+            </button>
+          )}
         </div>
         <p className="mt-2 text-[11px] text-gray-400 text-center">
           管家会自主判断并调用工具完成任务 · 所有执行过程都可见 · 经验会自动积累

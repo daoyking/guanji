@@ -1,6 +1,8 @@
 // Prevents additional console window on Windows in release, DO NOT REMOVE!!
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+use tauri::Manager;
+
 mod modules;
 mod db;
 mod theme;
@@ -80,6 +82,8 @@ fn main() {
             modules::agent::agent_list_models,
             modules::agent::agent_probe_model,
             modules::agent::agent_set_model,
+            modules::agent::agent_cancel,
+            modules::agent::agent_confirm,
             // Butler execution tools (M8.1)
             modules::shell::run_command,
             modules::shell::open_target,
@@ -98,6 +102,9 @@ fn main() {
             // 注意：Tauri Builder 只保留最后一个 .setup()，多个 setup 会静默覆盖，
             // 曾因拆成两个 setup 导致 init_db 从未执行、全部 DB 功能失效。
             db::init_db().map_err(|e| e.to_string())?;
+
+            // Agent 运行时控制状态（取消 / 破坏性操作确认桥接）
+            app.manage(modules::agent::AgentControl::new());
 
             // Apply persisted theme to webview on startup
             theme::apply_on_startup(app);

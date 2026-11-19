@@ -77,6 +77,17 @@ pub fn move_to_trash(path: &Path) -> Result<(), String> {
     })
 }
 
+/// 按【字符数】安全截断字符串（UTF-8 中文按字节切片会 panic）。
+/// 超长时追加省略标记，返回 (截断文本, 原字符数)。
+pub fn truncate_chars(s: &str, max: usize) -> (String, usize) {
+    let total = s.chars().count();
+    if total <= max {
+        return (s.to_string(), total);
+    }
+    let cut: String = s.chars().take(max).collect();
+    (format!("{}…（已截断，共{}字符）", cut, total), total)
+}
+
 /// 本机 HTTP 客户端：显式禁用系统/环境代理。
 /// reqwest::Client::new() 默认读取 HTTP_PROXY / macOS 系统代理，
 /// 会把发往 localhost:11434 等本机服务的请求转给代理，导致 502 Bad Gateway。
@@ -86,4 +97,25 @@ pub fn local_http_client() -> reqwest::Client {
         .no_proxy()
         .build()
         .unwrap_or_else(|_| reqwest::Client::new())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn truncate_chars_handles_chinese_without_panic() {
+        let s = "中".repeat(100);
+        let (cut, total) = truncate_chars(&s, 10);
+        assert_eq!(total, 100);
+        assert!(cut.starts_with(&"中".repeat(10)));
+        assert!(cut.contains("已截断"));
+    }
+
+    #[test]
+    fn truncate_chars_short_string_unchanged() {
+        let (cut, total) = truncate_chars("你好abc", 10);
+        assert_eq!(cut, "你好abc");
+        assert_eq!(total, 5);
+    }
 }

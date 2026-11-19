@@ -149,15 +149,17 @@ fn parse_intent_from_llm(s: &str) -> Result<IntentJson, String> {
 // ─── Embedding-based Semantic Search ────────────────────────────
 
 async fn embed_text(text: &str) -> Result<Vec<f32>, String> {
-    let url = format!("{}/api/embedding", ollama_url());
+    // Ollama 新版端点 /api/embed：请求用 input（可字符串或数组），响应 embeddings 为二维数组。
+    // 旧端点 /api/embeddings 已废弃（实测返回 404），body 用 prompt / 响应为单个 embedding。
+    let url = format!("{}/api/embed", ollama_url());
     let body = serde_json::json!({
         "model": "bge-m3",
-        "prompt": text
+        "input": text
     });
     let resp = crate::modules::local_http_client()
         .post(&url)
         .header("Content-Type", "application/json")
-        .timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(15))
         .json(&body)
         .send()
         .await
@@ -169,10 +171,14 @@ async fn embed_text(text: &str) -> Result<Vec<f32>, String> {
     let json: serde_json::Value = resp.json().await
         .map_err(|e| format!("embed parse: {}", e))?;
 
-    json["embedding"]
-        .as_array()
-        .map(|arr| arr.iter().map(|v| v.as_f64().unwrap_or(0.0) as f32).collect())
-        .ok_or("missing 'embedding' field".to_string())
+    // 新端点：{"embeddings": [[...]]}；兼容旧端点：{"embedding": [...]}
+    let values: Option<&Vec<serde_json::Value>> = json.get("embeddings")
+        .and_then(|v| v.as_array())
+        .and_then(|a| a.first())
+        .and_then(|v| v.as_array())
+        .or_else(|| json.get("embedding").and_then(|v| v.as_array()));
+    let arr = values.ok_or("missing 'embeddings' field".to_string())?;
+    Ok(arr.iter().map(|v| v.as_f64().unwrap_or(0.0) as f32).collect())
 }
 
 fn cosine_sim(a: &[f32], b: &[f32]) -> f32 {
@@ -201,8 +207,10 @@ pub async fn mem_search(query: String, top_n: Option<usize>) -> Result<Vec<Simil
 
     let mut scored: Vec<SimilarityResult> = Vec::new();
     for (id, content) in memories {
-        let sample = if content.len() > 500 { &content[..500] } else { &content };
-        if let Ok(mem_vec) = embed_text(sample).await { scored.push(SimilarityResult {
+        let sample: String = if content.chars().count() > 500 {
+            content.chars().take(500).collect()
+        } else { content.clone() };
+        if let Ok(mem_vec) = embed_text(&sample).await { scored.push(SimilarityResult {
             id,
             content,
             score: cosine_sim(&query_vec, &mem_vec),

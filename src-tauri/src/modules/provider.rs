@@ -50,9 +50,22 @@ fn row_to_provider(row: &rusqlite::Row) -> rusqlite::Result<Provider> {
     })
 }
 
-/// 列出所有云 provider（不含内置 Ollama）
-#[tauri::command]
-pub fn provider_list() -> Result<Vec<Provider>, String> {
+/// API Key 占位符：前端编辑已有服务商且不改 key 时回传此值，后端据此保留原 key。
+pub const MASKED_KEY: &str = "__UNCHANGED__";
+
+/// 对外展示的脱敏 key：只保留后 4 位；未设置则空串。
+fn mask_key(key: &str) -> String {
+    if key.trim().is_empty() {
+        return String::new();
+    }
+    if key.len() <= 4 {
+        return "••••".to_string();
+    }
+    format!("••••{}", &key[key.len() - 4..])
+}
+
+/// 读取全部 provider（含完整 key）—— 仅供后端内部调用，不要暴露给前端。
+pub(crate) fn provider_list_full() -> Result<Vec<Provider>, String> {
     with_db(|conn| {
         let mut stmt = conn.prepare(
             "SELECT id, name, base_url, api_key, enabled FROM model_providers ORDER BY created_at ASC, rowid ASC",
@@ -60,6 +73,18 @@ pub fn provider_list() -> Result<Vec<Provider>, String> {
         let rows = stmt.query_map([], row_to_provider)?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
     })
+}
+
+/// 列出所有云 provider（不含内置 Ollama）—— 对前端返回，api_key 已脱敏。
+#[tauri::command]
+pub fn provider_list() -> Result<Vec<Provider>, String> {
+    Ok(provider_list_full()?
+        .into_iter()
+        .map(|mut p| {
+            p.api_key = mask_key(&p.api_key);
+            p
+        })
+        .collect())
 }
 
 fn new_id() -> String {
@@ -88,7 +113,21 @@ pub fn provider_save(
         return Err("Base URL 不能为空".into());
     }
     let pid = id.filter(|s| !s.trim().is_empty()).unwrap_or_else(new_id);
-    let p = Provider { id: pid.clone(), name, base_url, api_key, enabled };
+
+    // 前端编辑时若未改动 key，会回传占位符——此时从库里取回原 key，避免被覆盖成占位符。
+    let effective_key = if api_key == MASKED_KEY {
+        with_db(|conn| {
+            Ok(conn.query_row(
+                "SELECT api_key FROM model_providers WHERE id = ?1",
+                rusqlite::params![&pid],
+                |r| r.get::<_, String>(0),
+            ).unwrap_or_default())
+        }).unwrap_or_default()
+    } else {
+        api_key
+    };
+
+    let p = Provider { id: pid.clone(), name, base_url, api_key: effective_key, enabled };
     let saved = with_db(|conn| {
         conn.execute(
             "INSERT INTO model_providers (id, name, base_url, api_key, enabled) VALUES (?1,?2,?3,?4,?5) \
@@ -186,5 +225,12 @@ mod tests {
             api_url("https://api.deepseek.com/v1/", "/models"),
             "https://api.deepseek.com/v1/models"
         );
+    }
+
+    #[test]
+    fn mask_key_hides_everything_but_last_four() {
+        assert_eq!(mask_key("sk-1234567890abcdef"), "••••cdef");
+        assert_eq!(mask_key(""), "");
+        assert_eq!(mask_key("abc"), "••••");
     }
 }

@@ -3,11 +3,66 @@
 //! 自主进化：历史执行轨迹作为 few-shot 注入 system prompt，越用越懂你。
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tauri::{AppHandle, Emitter};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
+use tauri::{AppHandle, Emitter, Manager, State};
 use crate::db::with_db;
 use crate::modules::provider::{self, Provider, LOCAL_PROVIDER_ID};
 
 const MAX_STEPS: usize = 8;
+
+/// Agent 运行时控制状态：取消标志 + 破坏性操作确认桥接。
+pub struct AgentControl {
+    cancelled: AtomicBool,
+    confirm_tx: Mutex<Option<tokio::sync::oneshot::Sender<bool>>>,
+}
+
+impl Default for AgentControl {
+    fn default() -> Self {
+        Self {
+            cancelled: AtomicBool::new(false),
+            confirm_tx: Mutex::new(None),
+        }
+    }
+}
+
+impl AgentControl {
+    pub fn new() -> Self { Self::default() }
+    fn reset(&self) { self.cancelled.store(false, Ordering::SeqCst); }
+    fn cancel(&self) { self.cancelled.store(true, Ordering::SeqCst); }
+    fn is_cancelled(&self) -> bool { self.cancelled.load(Ordering::SeqCst) }
+}
+
+/// 前端点击「停止」：置取消标志，循环在下一个检查点退出。
+#[tauri::command]
+pub fn agent_cancel(ctrl: State<'_, AgentControl>) -> Result<(), String> {
+    ctrl.cancel();
+    Ok(())
+}
+
+/// 前端确认/拒绝破坏性操作：把结果送回正在等待的 execute_tool。
+#[tauri::command]
+pub fn agent_confirm(approved: bool, ctrl: State<'_, AgentControl>) -> Result<(), String> {
+    if let Some(tx) = ctrl.confirm_tx.lock().unwrap().take() {
+        let _ = tx.send(approved);
+    }
+    Ok(())
+}
+
+/// 请求用户确认一个破坏性操作：发事件 + 等待前端应答（60s 超时，默认拒绝）。
+async fn request_confirm(app: &AppHandle, description: String) -> bool {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    if let Some(ctrl) = app.try_state::<AgentControl>() {
+        *ctrl.confirm_tx.lock().unwrap() = Some(tx);
+    } else {
+        return false; // 无 state 时安全拒绝
+    }
+    let _ = app.emit("agent://confirm", json!({"description": description}));
+    match tokio::time::timeout(std::time::Duration::from_secs(60), rx).await {
+        Ok(Ok(approved)) => approved,
+        _ => false, // 超时或前端断开 → 默认拒绝
+    }
+}
 
 fn ollama_url() -> String {
     std::env::var("OLLAMA_HOST").unwrap_or_else(|_| "http://localhost:11434".to_string())
@@ -70,7 +125,7 @@ fn resolve_provider(provider_id: &str) -> Result<Provider, String> {
             enabled: true,
         });
     }
-    provider::provider_list()?
+    provider::provider_list_full()?
         .into_iter()
         .find(|p| p.id == provider_id)
         .ok_or_else(|| format!("服务商 {} 已不存在，请重新选择模型", provider_id))
@@ -306,18 +361,19 @@ fn system_prompt(successes: &[String], failures: &[String]) -> String {
 /// 统一聊天调用：返回 {content, tool_calls}，屏蔽 Ollama / OpenAI 兼容协议的响应差异。
 /// - 本地 Ollama：POST {base}/api/chat，响应 message.content + message.tool_calls
 /// - 云 provider：POST {base}/chat/completions（Bearer key），响应 choices[0].message
-async fn chat_complete(messages: Vec<Value>) -> Result<Value, String> {
-    let (provider_id, model) = parse_model_ref(&model_ref());
+/// `model_reference` 为完整的 provider::model 引用，由调用方在对话开始时读取一次后透传。
+async fn chat_complete(messages: Vec<Value>, model_reference: &str, app: Option<&AppHandle>) -> Result<Value, String> {
+    let (provider_id, model) = parse_model_ref(model_reference);
     let p = resolve_provider(&provider_id)?;
     let tools = tools_schema();
 
     if p.id == LOCAL_PROVIDER_ID {
-        // ── 本机 Ollama 原生协议 ──
+        // ── 本机 Ollama 原生协议（NDJSON 流式）──
         let url = format!("{}/api/chat", provider::normalize_base_url(&p.base_url));
         let body = json!({
             "model": model,
             "messages": messages,
-            "stream": false,
+            "stream": true,
             "tools": tools,
             "options": {"temperature": 0.1, "num_predict": 512}
         });
@@ -333,55 +389,142 @@ async fn chat_complete(messages: Vec<Value>) -> Result<Value, String> {
             let text = resp.text().await.unwrap_or_default();
             return Err(format!("Ollama HTTP {}: {}", status, text.chars().take(160).collect::<String>()));
         }
-        let body: Value = resp.json().await.map_err(|e| format!("解析响应失败: {}", e))?;
-        let msg = body["message"].clone();
-        Ok(json!({
-            "content": msg["content"].as_str().unwrap_or(""),
-            "tool_calls": normalize_tool_calls(msg["tool_calls"].as_array(), false),
-        }))
+
+        let mut resp = resp;
+        let mut buf = String::new();
+        let mut content = String::new();
+        let mut last_tool_calls: Vec<Value> = Vec::new();
+        while let Some(chunk) = resp.chunk().await.map_err(|e| format!("读取 Ollama 响应失败: {}", e))? {
+            // 流式输出期间也响应取消
+            if let Some(a) = app {
+                if a.try_state::<AgentControl>().map(|c| c.is_cancelled()).unwrap_or(false) { break; }
+            }
+            buf.push_str(&String::from_utf8_lossy(&chunk));
+            // NDJSON：一行一个 JSON 对象
+            while let Some(pos) = buf.find('\n') {
+                let line: String = buf.drain(..=pos).collect();
+                let line = line.trim();
+                if line.is_empty() { continue; }
+                let v: Value = match serde_json::from_str(line) { Ok(v) => v, Err(_) => continue };
+                let msg = &v["message"];
+                if let Some(delta) = msg["content"].as_str() {
+                    if !delta.is_empty() {
+                        content.push_str(delta);
+                        if let Some(a) = app {
+                            let _ = a.emit("agent://delta", json!({"text": content}));
+                        }
+                    }
+                }
+                if let Some(tc) = msg["tool_calls"].as_array() {
+                    if !tc.is_empty() { last_tool_calls = tc.clone(); }
+                }
+            }
+        }
+        return Ok(json!({
+            "content": content,
+            "tool_calls": normalize_tool_calls(Some(&last_tool_calls), false),
+        }));
     } else {
-        // ── OpenAI 兼容协议（云模型）──
+        // ── OpenAI 兼容协议（云模型，SSE 流式）──
         let url = provider::api_url(&p.base_url, "chat/completions");
         let body = json!({
             "model": model,
             "messages": messages,
-            "stream": false,
+            "stream": true,
             "tools": tools,
             "tool_choice": "auto",
             "temperature": 0.1,
             "max_tokens": 1024
         });
-        let mut req = provider::cloud_http_client()
-            .post(&url)
-            .json(&body)
-            .timeout(std::time::Duration::from_secs(120));
-        if !p.api_key.trim().is_empty() {
-            req = req.bearer_auth(p.api_key.trim());
+        let bearer = p.api_key.trim().to_string();
+
+        // 指数退避重试：仅对 429（限流）与 5xx（服务端临时故障）重试，最多 3 次。
+        // 注意：重试发生在读取任何 delta 之前（连接/响应头阶段），避免重复输出。
+        const MAX_ATTEMPTS: u32 = 3;
+        let mut last_err = String::new();
+        let mut resp: Option<reqwest::Response> = None;
+        for attempt in 0..MAX_ATTEMPTS {
+            let mut req = provider::cloud_http_client()
+                .post(&url)
+                .json(&body)
+                .timeout(std::time::Duration::from_secs(120));
+            if !bearer.is_empty() { req = req.bearer_auth(&bearer); }
+            match req.send().await {
+                Ok(r) if r.status().is_success() => { resp = Some(r); break; }
+                Ok(r) => {
+                    let status = r.status();
+                    let code = status.as_u16();
+                    let text = r.text().await.unwrap_or_default();
+                    last_err = format!("{} HTTP {}: {}", p.name, status, text.chars().take(300).collect::<String>());
+                    if code != 429 && !(500..600).contains(&code) { break; }
+                }
+                Err(e) => { last_err = format!("{} 请求失败: {}", p.name, e); break; }
+            }
+            if attempt + 1 >= MAX_ATTEMPTS { break; }
+            let backoff_ms = 500u64 * (1u64 << attempt);
+            tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
         }
-        let resp = req.send().await.map_err(|e| format!("{} 请求失败: {}", p.name, e))?;
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        if !status.is_success() {
-            return Err(format!("{} HTTP {}: {}", p.name, status, text.chars().take(300).collect::<String>()));
+        let mut resp = resp.ok_or(last_err)?;
+
+        let mut buf = String::new();
+        let mut content = String::new();
+        // 云流式 tool_calls 按 index 分片：id/name 首片给，arguments 逐片追加
+        let mut tc_by_index: std::collections::BTreeMap<usize, Value> = std::collections::BTreeMap::new();
+        while let Some(chunk) = resp.chunk().await.map_err(|e| format!("读取 {} 响应失败: {}", p.name, e))? {
+            // 流式输出期间也响应取消
+            if let Some(a) = app {
+                if a.try_state::<AgentControl>().map(|c| c.is_cancelled()).unwrap_or(false) { break; }
+            }
+            buf.push_str(&String::from_utf8_lossy(&chunk));
+            while let Some(pos) = buf.find('\n') {
+                let line: String = buf.drain(..=pos).collect();
+                let line = line.trim();
+                if line.is_empty() { continue; }
+                let data = match line.strip_prefix("data:") { Some(d) => d.trim(), None => continue };
+                if data == "[DONE]" { continue; }
+                let v: Value = match serde_json::from_str(data) { Ok(v) => v, Err(_) => continue };
+                let delta = &v["choices"][0]["delta"];
+                if let Some(d) = delta["content"].as_str() {
+                    if !d.is_empty() {
+                        content.push_str(d);
+                        if let Some(a) = app {
+                            let _ = a.emit("agent://delta", json!({"text": content}));
+                        }
+                    }
+                }
+                if let Some(tcs) = delta["tool_calls"].as_array() {
+                    for tc in tcs {
+                        let idx = tc["index"].as_u64().unwrap_or(0) as usize;
+                        let entry = tc_by_index.entry(idx).or_insert_with(|| json!({
+                            "id": "", "type": "function",
+                            "function": {"name": "", "arguments": ""}
+                        }));
+                        if let Some(id) = tc["id"].as_str() { if !id.is_empty() { entry["id"] = json!(id); } }
+                        if let Some(name) = tc["function"]["name"].as_str() {
+                            if !name.is_empty() { entry["function"]["name"] = json!(name); }
+                        }
+                        if let Some(args) = tc["function"]["arguments"].as_str() {
+                            let cur = entry["function"]["arguments"].as_str().unwrap_or("").to_string();
+                            entry["function"]["arguments"] = json!(format!("{}{}", cur, args));
+                        }
+                    }
+                }
+            }
         }
-        let v: Value = serde_json::from_str(&text).map_err(|e| format!("响应解析失败：{}", e))?;
-        let msg = &v["choices"][0]["message"];
-        if msg.is_null() {
-            return Err(format!("响应缺少 choices[0].message：{}", text.chars().take(200).collect::<String>()));
-        }
-        Ok(json!({
-            "content": msg["content"].as_str().unwrap_or(""),
-            // OpenAI 的 arguments 是 JSON 字符串，需解析为对象
-            "tool_calls": normalize_tool_calls(msg["tool_calls"].as_array(), true),
-        }))
+        // 组装成 OpenAI 兼容的 tool_calls 数组交给 normalize 解析
+        let assembled: Vec<Value> = tc_by_index.into_values().collect();
+        let normalized = normalize_tool_calls(Some(&assembled), true);
+        return Ok(json!({"content": content, "tool_calls": normalized}));
     }
 }
 
-/// 把两种协议的 tool_calls 统一成 [{function:{name, arguments: Value}}]
+/// 把两种协议的 tool_calls 统一成
+/// [{id, type:"function", function:{name, arguments: Value}}]
+/// 保留 id 以便按 OpenAI 规范用 role:tool + tool_call_id 回填。
 fn normalize_tool_calls(calls: Option<&Vec<Value>>, openai_style: bool) -> Vec<Value> {
     let mut out = Vec::new();
     if let Some(calls) = calls {
-        for c in calls {
+        for (idx, c) in calls.iter().enumerate() {
             let f = &c["function"];
             let name = f["name"].as_str().unwrap_or("").to_string();
             if name.is_empty() { continue; }
@@ -393,7 +536,15 @@ fn normalize_tool_calls(calls: Option<&Vec<Value>>, openai_style: bool) -> Vec<V
             } else {
                 f["arguments"].clone()
             };
-            out.push(json!({"function": {"name": name, "arguments": args}}));
+            // Ollama 原生 tool_calls 通常无 id，生成一个稳定的占位 id
+            let id = c["id"].as_str().filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| format!("call_{}", idx));
+            out.push(json!({
+                "id": id,
+                "type": "function",
+                "function": {"name": name, "arguments": args}
+            }));
         }
     }
     out
@@ -496,6 +647,23 @@ fn extract_after<'a>(text: &'a str, marker: &str) -> Option<&'a str> {
 // ─── 工具执行分发 ──────────────────────────────────────────────
 
 async fn execute_tool(app: &AppHandle, name: &str, args: &Value) -> Result<String, String> {
+    // ── 破坏性操作二次确认（human-in-the-loop）──
+    // 这些工具会改变用户系统状态，执行前必须由用户明确同意。
+    let confirm_desc = match name {
+        "run_command" => Some(format!("执行命令：{}", args["command"].as_str().unwrap_or(""))),
+        "write_file" => Some(format!("写入文件：{}（{}）",
+            args["path"].as_str().unwrap_or(""),
+            if args["append"].as_bool().unwrap_or(false) { "追加" } else { "覆盖" })),
+        "delete_reminder" => Some(format!("删除提醒 #{}", args["id"].as_i64().unwrap_or(-1))),
+        "clean_temp_files" => Some("清理系统临时文件".to_string()),
+        _ => None,
+    };
+    if let Some(desc) = confirm_desc {
+        if !request_confirm(app, desc).await {
+            return Err("用户取消了此操作".to_string());
+        }
+    }
+
     match name {
         "get_system_info" => {
             crate::modules::system::get_system_info().await.map(|v| v.to_string())
@@ -642,7 +810,12 @@ fn save_experience(intent: &str, traces: &[ToolTrace], success: bool) {
 
 #[tauri::command]
 pub async fn agent_chat(app: AppHandle, message: String, history: Option<Vec<Value>>) -> Result<AgentReply, String> {
+    // 对话开始时读取一次模型引用，整轮迭代复用，避免每步 spawn 线程读 SQLite。
+    let model_ref = model_ref();
+    let display_model = parse_model_ref(&model_ref).1;
     let (successes, failures) = load_experiences(&message);
+    // 每次新对话重置取消标志
+    if let Some(ctrl) = app.try_state::<AgentControl>() { ctrl.reset(); }
     let mut messages: Vec<Value> = vec![
         json!({"role": "system", "content": system_prompt(&successes, &failures)}),
     ];
@@ -654,7 +827,18 @@ pub async fn agent_chat(app: AppHandle, message: String, history: Option<Vec<Val
     let mut traces: Vec<ToolTrace> = Vec::new();
 
     for step in 1..=MAX_STEPS {
-        let resp = chat_complete(messages.clone()).await?;
+        // 取消检查点：用户点「停止」后在下一个循环边界退出
+        if app.try_state::<AgentControl>().map(|c| c.is_cancelled()).unwrap_or(false) {
+            let answer = "已停止执行。".to_string();
+            let _ = app.emit("agent://cancelled", json!({"steps": step - 1}));
+            return Ok(AgentReply { answer, traces, steps: step - 1, model: display_model });
+        }
+        let resp = chat_complete(messages.clone(), &model_ref, Some(&app)).await?;
+        // 流式读取中可能已被取消（此时 resp 为部分内容），统一在此收口
+        if app.try_state::<AgentControl>().map(|c| c.is_cancelled()).unwrap_or(false) {
+            let _ = app.emit("agent://cancelled", json!({"steps": step - 1}));
+            return Ok(AgentReply { answer: "已停止执行。".to_string(), traces, steps: step - 1, model: display_model });
+        }
         let content = resp["content"].as_str().unwrap_or("").to_string();
         let native = resp["tool_calls"].as_array().cloned();
 
@@ -672,11 +856,45 @@ pub async fn agent_chat(app: AppHandle, message: String, history: Option<Vec<Val
                 answer,
                 traces,
                 steps: step,
-                model: agent_model(),
+                model: display_model.clone(),
             });
         }
 
         let name = tool_name.unwrap();
+        let is_local = parse_model_ref(&model_ref).0 == LOCAL_PROVIDER_ID;
+
+        // 记录模型本轮的 assistant 消息——让模型在后续迭代里能看到自己调用过什么工具。
+        // 原生 tool_calls 时带上 tool_calls 字段，才能与后面的 role:tool 正确配对。
+        let executed_call_id: Option<String> = if let Some(calls) = native.as_ref() {
+            calls.first().and_then(|c| c["id"].as_str().map(String::from))
+        } else { None };
+        if let Some(calls) = native.as_ref() {
+            // 只保留实际执行的第一个工具调用，保证 assistant.tool_calls 与 tool 结果一一对应。
+            // OpenAI 协议要求 function.arguments 为 JSON 字符串（本地 Ollama 接受对象）。
+            let mut assistant_msg = json!({"role": "assistant", "content": content});
+            if let Some(first) = calls.first() {
+                if is_local {
+                    assistant_msg["tool_calls"] = json!([first]);
+                } else {
+                    let name = first["function"]["name"].as_str().unwrap_or("");
+                    let args_val = &first["function"]["arguments"];
+                    let args_str = if args_val.is_string() {
+                        args_val.as_str().unwrap_or("{}").to_string()
+                    } else {
+                        args_val.to_string()
+                    };
+                    assistant_msg["tool_calls"] = json!([{
+                        "id": first["id"].as_str().unwrap_or("call_0"),
+                        "type": "function",
+                        "function": {"name": name, "arguments": args_str}
+                    }]);
+                }
+            }
+            messages.push(assistant_msg);
+        } else {
+            messages.push(json!({"role": "assistant", "content": content}));
+        }
+
         let _ = app.emit("agent://step", json!({
             "step": step, "tool": name, "args": args, "status": "running"
         }));
@@ -688,12 +906,8 @@ pub async fn agent_chat(app: AppHandle, message: String, history: Option<Vec<Val
             Ok(v) => (v, true),
             Err(e) => (e, false),
         };
-        // 截断过长的工具输出，避免撑爆上下文
-        let result_short = if result_str.len() > 3000 {
-            format!("{}…（已截断，共{}字符）", &result_str[..3000], result_str.len())
-        } else {
-            result_str.clone()
-        };
+        // 截断过长的工具输出，避免撑爆上下文（按字符，避免中文 UTF-8 越界 panic）
+        let (result_short, _) = crate::modules::truncate_chars(&result_str, 3000);
 
         traces.push(ToolTrace {
             step,
@@ -708,20 +922,36 @@ pub async fn agent_chat(app: AppHandle, message: String, history: Option<Vec<Val
             "result": result_short, "elapsed_ms": elapsed_ms
         }));
 
-        // 把工具结果回填给模型，继续迭代。
-        // 用 user 角色 + 明确标记，而非 role:tool——后者在 OpenAI 协议下要求与上一条
-        // assistant.tool_calls 用 tool_call_id 严格配对，云模型若以文本输出工具调用会 400。
-        // 文本回填对本地 Ollama 与所有 OpenAI 兼容端点都安全。
-        messages.push(json!({
-            "role": "user",
-            "content": format!("[工具结果] 工具 {} 执行{}：{}", name, if ok {"成功"} else {"失败"}, result_short)
-        }));
+        // 工具结果回填：
+        // - 云模型 + 原生 tool_calls → role:tool + tool_call_id（OpenAI 规范，避免语义污染）
+        // - 本地 Ollama / 文本工具调用 → user 文本标记（Ollama 与文本调用模式实测兼容）
+        if !is_local {
+            if let Some(call_id) = executed_call_id {
+                messages.push(json!({
+                    "role": "tool",
+                    "tool_call_id": call_id,
+                    "content": result_short
+                }));
+            } else {
+                // 云模型以纯文本输出工具调用（无原生 call id）：无 assistant.tool_calls 可配对，
+                // 只能用 user 文本回填，否则 OpenAI 协议会因孤立 tool 消息返回 400。
+                messages.push(json!({
+                    "role": "user",
+                    "content": format!("[工具结果] 工具 {} 执行{}：{}", name, if ok {"成功"} else {"失败"}, result_short)
+                }));
+            }
+        } else {
+            messages.push(json!({
+                "role": "user",
+                "content": format!("[工具结果] 工具 {} 执行{}：{}", name, if ok {"成功"} else {"失败"}, result_short)
+            }));
+        }
     }
 
     let answer = "抱歉，我在限定步数内没能完成任务。可能是工具结果不够明确，请换个说法或拆分指令再试。".to_string();
     let _ = app.emit("agent://done", json!({"answer": answer, "steps": MAX_STEPS}));
     save_experience(&message, &traces, false);
-    Ok(AgentReply { answer, traces, steps: MAX_STEPS, model: agent_model() })
+    Ok(AgentReply { answer, traces, steps: MAX_STEPS, model: display_model })
 }
 
 #[tauri::command]
@@ -840,7 +1070,7 @@ pub async fn agent_list_models() -> Result<Vec<Value>, String> {
     }
 
     // 2) 云 providers（顺序拉取，单个失败不影响其它；provider 数量少，无需并发）
-    let providers: Vec<Provider> = provider::provider_list()?.into_iter().filter(|p| p.enabled).collect();
+    let providers: Vec<Provider> = provider::provider_list_full()?.into_iter().filter(|p| p.enabled).collect();
     for p in &providers {
         match provider::fetch_cloud_models(&p.base_url, &p.api_key).await {
             Ok(ids) => for name in ids {

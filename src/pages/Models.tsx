@@ -97,7 +97,9 @@ export default function Models() {
       return;
     }
     try {
-      await invoke('provider_save', { id: editingId, name, baseUrl: base_url, apiKey: api_key, enabled: true });
+      // 编辑态且 key 留空 → 回传占位符，后端保留原 key；新建态留空则真的留空
+      const keyToSend = editingId && !api_key.trim() ? '__UNCHANGED__' : api_key;
+      await invoke('provider_save', { id: editingId, name, baseUrl: base_url, apiKey: keyToSend, enabled: true });
       setProviderForm({ ...emptyProvider });
       setEditingId(null);
       setProviderMsg(`✓ 已保存服务商「${name}」`);
@@ -108,9 +110,10 @@ export default function Models() {
   };
 
   const editProvider = (p: Provider) => {
-    setProviderForm({ name: p.name, base_url: p.base_url, api_key: p.api_key });
+    // key 输入框留空；保存时后端自动保留原 key（返回数据里的 api_key 已脱敏，不含明文）
+    setProviderForm({ name: p.name, base_url: p.base_url, api_key: '' });
     setEditingId(p.id);
-    setProviderMsg('');
+    setProviderMsg(p.api_key ? 'Key 已安全保存，留空即保持不变；填入新值则覆盖' : '该服务未设置 Key');
   };
 
   const removeProvider = async (p: Provider) => {
@@ -251,7 +254,7 @@ export default function Models() {
             placeholder="Base URL，如 https://api.deepseek.com/v1"
             className="px-3 py-2 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-sm text-gray-900 dark:text-white placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-purple-500" />
           <input value={providerForm.api_key} onChange={e => setProviderForm({ ...providerForm, api_key: e.target.value })}
-            type="password" placeholder="API Key（可选，本机服务可留空）"
+            type="password" placeholder={editingId ? 'API Key（留空保持不变）' : 'API Key（可选，本机服务可留空）'}
             className="px-3 py-2 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-sm text-gray-900 dark:text-white placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-purple-500" />
         </div>
         <div className="flex gap-2 mb-3">

@@ -92,7 +92,7 @@ pub async fn probe_service(service_id: String) -> Result<ServiceStatus, String> 
             if r.status().is_success() {
                 result.healthy = true;
                 let text = r.text().await.unwrap_or_default();
-                result.detail = Some(if text.len() > 80 { &text[..80] } else { &text }.to_string());
+                result.detail = Some(crate::modules::truncate_chars(&text, 80).0);
             } else {
                 result.healthy = false;
                 result.detail = Some(format!("status={}", r.status()));
