@@ -255,11 +255,15 @@ export default function AgentChat() {
     setInput('');
     setBusy(true);
 
-    // 构造历史（最近 8 轮）
+    // 构造历史（最近 8 轮），带上工具轨迹让模型看到上次是怎么解决的
     const history = messages
       .filter((m) => m.id !== 'welcome')
       .slice(-16)
-      .map((m) => ({ role: m.role, content: m.content }));
+      .map((m) => ({
+        role: m.role,
+        content: m.content,
+        ...(m.role === 'assistant' && m.traces && m.traces.length > 0 ? { traces: m.traces } : {}),
+      }));
 
     const assistantId = `a-${Date.now()}`;
     const userMsg: Message = { id: `u-${Date.now()}`, role: 'user', content, time: now() };

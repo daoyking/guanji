@@ -275,9 +275,19 @@ fn relevance(intent: &str, candidate: &str) -> f32 {
     if union == 0 { 0.0 } else { inter as f32 / union as f32 }
 }
 
-/// 按与当前意图的相关度检索历史经验，分离「成功做法」与「失败教训」
-fn load_experiences(intent: &str) -> (Vec<String>, Vec<String>) {
-    let rows = std::thread::spawn(|| {
+/// 语义相似度 + 词面重合的混合打分。语义分 <0 时视为不可用，退化为纯词面。
+fn hybrid_score(semantic: Option<f32>, lexical: f32) -> f32 {
+    match semantic {
+        Some(s) if s >= 0.0 => 0.7 * s + 0.3 * lexical,
+        _ => lexical,
+    }
+}
+
+/// 按与当前意图的相关度检索历史经验，分离「成功做法」与「失败教训」。
+/// 语义相似度（bge-m3 批量 embedding）为主，bigram 词面重合为辅；
+/// embedding 不可用时（Ollama 未启动/无 bge-m3）自动降级为纯 bigram。
+async fn load_experiences(intent: &str) -> (Vec<String>, Vec<String>) {
+    let rows = tokio::task::spawn_blocking(|| {
         with_db(|conn| {
             let mut stmt = conn.prepare(
                 "SELECT tag, content, COALESCE(summary,'') FROM memories \
@@ -292,15 +302,32 @@ fn load_experiences(intent: &str) -> (Vec<String>, Vec<String>) {
             rows.collect::<rusqlite::Result<Vec<_>>>()
         })
     })
-    .join()
+    .await
     .ok()
     .and_then(|r| r.ok())
     .unwrap_or_default();
 
+    if rows.is_empty() { return (Vec::new(), Vec::new()); }
+
+    // 批量算语义相似度：一次请求拿到 intent + 所有候选的向量
+    let mut texts: Vec<String> = vec![intent.to_string()];
+    texts.extend(rows.iter().map(|(_, _, summary)| {
+        if summary.is_empty() { return summary.clone(); }
+        // 用 summary（原始意图）做语义匹配，比整段经验内容更聚焦
+        summary.chars().take(120).collect()
+    }));
+    let semantic_scores: Option<Vec<f32>> = match crate::modules::memory::embed_texts_batch(&texts).await {
+        Ok(vectors) if !vectors.is_empty() => Some(
+            vectors[1..].iter().map(|v| crate::modules::memory::cosine_sim(&vectors[0], v)).collect()
+        ),
+        _ => None,
+    };
+
     let mut successes: Vec<(f32, String)> = Vec::new();
     let mut failures: Vec<(f32, String)> = Vec::new();
-    for (tag, content, summary) in rows {
-        let score = relevance(intent, &summary);
+    for (idx, (tag, content, summary)) in rows.into_iter().enumerate() {
+        let lexical = relevance(intent, &summary);
+        let score = hybrid_score(semantic_scores.as_ref().and_then(|s| s.get(idx).copied()), lexical);
         if tag == "agent_failure" {
             failures.push((score, content));
         } else {
@@ -336,13 +363,14 @@ fn system_prompt(successes: &[String], failures: &[String]) -> String {
     format!(r#"你是「管家」，一台 macOS 电脑的全能 AI Agent。用户用中文下达指令，你通过调用工具真正把事情做完，而不是只给建议。
 
 ## 工作方法
-1. 分析用户意图，选择最合适的工具（可连续调用多个工具完成复杂任务）。
-2. 每次只输出一个工具调用；拿到结果后再决定下一步。
+1. 分析用户意图，选择最合适的工具。若多个任务互不依赖，可在一次回复中输出多个工具调用并行执行。
+2. 有依赖关系的工具要分步调用：拿到前一步结果再决定下一步。
 3. 信息足够时，用简洁中文给出最终答案（不要复述工具原始输出）。
 
 ## 工具调用格式（严格遵守）
-只输出一个 JSON 对象，不要输出其它任何文字。必须是下面这种带 name / arguments 两个键的格式：
-{{"name": "工具名", "arguments": {{...}}}}
+输出 JSON 对象（单个工具）或 JSON 数组（多个独立工具并行），不要输出其它任何文字。必须是下面这种带 name / arguments 两个键的格式：
+单个：{{"name": "工具名", "arguments": {{...}}}}
+多个：[{{"name": "工具A", "arguments": {{...}}}}, {{"name": "工具B", "arguments": {{...}}}}]
 ❌ 绝对不要输出 {{"工具名": {{...}}}} 这种把工具名当键的格式，那是错误的。
 若无需调用工具、可直接回答，输出：
 {{"answer": "你的最终回答"}}
@@ -836,31 +864,49 @@ async fn execute_tool(app: &AppHandle, name: &str, args: &Value) -> Result<Strin
 
 // ─── 经验沉淀 ──────────────────────────────────────────────────
 
+/// 把一条工具轨迹压成紧凑单行，供经验沉淀与历史回放复用。
+/// 形如：list_large_files(threshold_mb=100) ✓ → 12 个文件
+fn format_trace_brief(t: &ToolTrace) -> String {
+    let args = t.args.as_object().map(|obj| {
+        obj.iter().take(4).map(|(k, v)| {
+            let val = match v {
+                Value::String(s) => crate::modules::truncate_chars(s, 40).0,
+                _ => v.to_string(),
+            };
+            format!("{}={}", k, crate::modules::truncate_chars(&val, 50).0)
+        }).collect::<Vec<_>>().join(",")
+    }).unwrap_or_default();
+    let status = if t.ok { "✓" } else { "✗" };
+    let result = if t.result.is_empty() { String::new() } else {
+        format!(" → {}", crate::modules::truncate_chars(&t.result, 80).0)
+    };
+    format!("{}({}) {}{}", t.tool, args, status, result)
+}
+
 fn save_experience(intent: &str, traces: &[ToolTrace], success: bool) {
-    let tools: Vec<String> = traces.iter().map(|t| t.tool.clone()).collect();
-    if tools.is_empty() { return; }
+    if traces.is_empty() { return; }
+    // 按 step 分组：同一 step 的多个工具是并行调用
+    let mut by_step: std::collections::BTreeMap<usize, Vec<&ToolTrace>> = std::collections::BTreeMap::new();
+    for t in traces {
+        by_step.entry(t.step).or_default().push(t);
+    }
+    let mut lines = Vec::new();
+    for (step, group) in by_step {
+        let prefix = if group.len() > 1 { format!("{}并行:", step) } else { String::new() };
+        let briefs: Vec<String> = group.iter().map(|t| format_trace_brief(t)).collect();
+        lines.push(format!("{}{}", prefix, briefs.join(" + ")));
+    }
+    let path = lines.join("\n  ");
     let (tag, content) = if success {
-        (
-            "agent_experience",
-            format!("用户意图「{}」→ 使用工具 [{}] 成功完成", intent, tools.join(" → ")),
-        )
+        ("agent_experience", format!("用户意图「{}」→ 成功路径：\n  {}", intent, path))
     } else {
-        // 失败复盘：记录踩坑点，供后续同类意图规避
-        let failed_tools: Vec<String> = traces.iter()
-            .filter(|t| !t.ok)
-            .map(|t| format!("{}（{}）", t.tool,
-                t.result.chars().take(60).collect::<String>()))
-            .collect();
-        let reason = if failed_tools.is_empty() {
+        let failed: Vec<String> = traces.iter().filter(|t| !t.ok).map(|t| t.tool.clone()).collect();
+        let reason = if failed.is_empty() {
             "在限定步数内未收敛".to_string()
         } else {
-            format!("工具执行失败：{}", failed_tools.join("; "))
+            format!("失败工具：{}", failed.join(", "))
         };
-        (
-            "agent_failure",
-            format!("用户意图「{}」→ 工具链 [{}] 失败，原因：{}。下次遇到类似意图应调整策略。",
-                intent, tools.join(" → "), reason),
-        )
+        ("agent_failure", format!("用户意图「{}」→ 失败路径：\n  {}\n原因：{}。下次遇到类似意图应调整策略。", intent, path, reason))
     };
     let intent_owned = intent.to_string();
     let tag_owned = tag.to_string();
@@ -890,19 +936,62 @@ fn format_results_as_text(results: &[(String, bool, String)]) -> String {
     s
 }
 
+/// 把消息对象数组里的工具轨迹压成文本注入 assistant.content。
+/// 模型由此能看到自己上次是怎么用工具解决问题的（few-shot），而非只看到最终答案。
+/// 兼容两种轨迹格式：step 事件（status 字段）与 agent_chat 返回（ok 字段）。
+fn enrich_history_traces(messages: &mut [Value]) {
+    for m in messages.iter_mut() {
+        if m.get("role").and_then(|v| v.as_str()) != Some("assistant") { continue; }
+        let traces = match m.get("traces").and_then(|v| v.as_array()) {
+            Some(t) if !t.is_empty() => t.clone(),
+            _ => { m.as_object_mut().map(|o| o.remove("traces")); continue; }
+        };
+        let lines: Vec<String> = traces.iter().take(8).map(|t| {
+            let tool = t.get("tool").and_then(|v| v.as_str()).unwrap_or("?");
+            let args_obj = t.get("args").and_then(|v| v.as_object());
+            let args = args_obj.map(|obj| {
+                obj.iter().take(3).map(|(k, v)| {
+                    let val = match v {
+                        Value::String(s) => crate::modules::truncate_chars(s, 30).0,
+                        _ => v.to_string(),
+                    };
+                    format!("{}={}", k, crate::modules::truncate_chars(&val, 40).0)
+                }).collect::<Vec<_>>().join(",")
+            }).unwrap_or_default();
+            let ok = t.get("ok").and_then(|v| v.as_bool())
+                .or_else(|| t.get("status").and_then(|v| v.as_str()).map(|s| s == "done"))
+                .unwrap_or(true);
+            let result = t.get("result").and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(|s| format!(" → {}", crate::modules::truncate_chars(s, 60).0))
+                .unwrap_or_default();
+            format!("{}({}) {}{}", tool, args, if ok {"✓"} else {"✗"}, result)
+        }).collect();
+        let mut content = m.get("content").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        if !lines.is_empty() {
+            content.push_str("\n\n[上次执行轨迹] ");
+            content.push_str(&lines.join(" → "));
+        }
+        m["content"] = json!(content);
+        m.as_object_mut().map(|o| o.remove("traces"));
+    }
+}
+
 #[tauri::command]
 pub async fn agent_chat(app: AppHandle, message: String, history: Option<Vec<Value>>) -> Result<AgentReply, String> {
     // 对话开始时读取一次模型引用，整轮迭代复用，避免每步 spawn 线程读 SQLite。
     let model_ref = model_ref();
     let display_model = parse_model_ref(&model_ref).1;
-    let (successes, failures) = load_experiences(&message);
+    let (successes, failures) = load_experiences(&message).await;
     // 每次新对话重置取消标志
     if let Some(ctrl) = app.try_state::<AgentControl>() { ctrl.reset(); }
     let mut messages: Vec<Value> = vec![
         json!({"role": "system", "content": system_prompt(&successes, &failures)}),
     ];
     if let Some(h) = history {
-        for m in h.into_iter().take(20) { messages.push(m); }
+        let mut hist: Vec<Value> = h.into_iter().take(20).collect();
+        enrich_history_traces(&mut hist);
+        messages.extend(hist);
     }
     messages.push(json!({"role": "user", "content": message.clone()}));
 
@@ -1383,6 +1472,67 @@ mod tests {
         let (name, args, _) = parse_model_output(text, None).unwrap();
         assert_eq!(name.as_deref(), Some("notify"));
         assert_eq!(args["title"], "完成");
+    }
+
+    #[test]
+    fn enrich_history_injects_traces_and_removes_raw_field() {
+        let mut msgs = vec![
+            json!({"role": "user", "content": "查一下进程"}),
+            json!({
+                "role": "assistant", "content": "有 48 个进程",
+                "traces": [
+                    {"step": 1, "tool": "list_processes", "args": {"limit": 5}, "status": "done", "result": "48 个进程"},
+                    {"step": 2, "tool": "run_command", "args": {"command": "uptime"}, "status": "error", "result": "失败"}
+                ]
+            }),
+        ];
+        enrich_history_traces(&mut msgs);
+        let c = msgs[1]["content"].as_str().unwrap();
+        assert!(c.contains("有 48 个进程"));
+        assert!(c.contains("[上次执行轨迹]"));
+        assert!(c.contains("list_processes(limit=5) ✓"));
+        assert!(c.contains("run_command(command=uptime) ✗"));
+        assert!(msgs[1].get("traces").is_none(), "原始 traces 字段应被移除");
+        assert!(msgs[0].get("traces").is_none());
+    }
+
+    #[test]
+    fn enrich_history_accepts_ok_field_from_agent_reply() {
+        let mut msgs = vec![json!({
+            "role": "assistant", "content": "ok",
+            "traces": [{"step": 1, "tool": "mem_list", "args": {}, "ok": false, "result": "err"}]
+        })];
+        enrich_history_traces(&mut msgs);
+        let c = msgs[0]["content"].as_str().unwrap();
+        assert!(c.contains("mem_list() ✗"));
+    }
+
+    #[test]
+    fn hybrid_score_uses_semantic_when_available() {
+        // 语义高、词面 0：应接近 0.7
+        let s = hybrid_score(Some(0.95), 0.0);
+        assert!((s - 0.665).abs() < 0.001, "实际 {}", s);
+        // 语义不可用：退化为纯词面
+        assert_eq!(hybrid_score(None, 0.4), 0.4);
+        assert_eq!(hybrid_score(Some(-1.0), 0.25), 0.25);
+    }
+
+    #[test]
+    fn format_trace_brief_is_compact_and_keeps_status() {
+        let t = ToolTrace {
+            step: 1,
+            call_id: Some(0),
+            tool: "list_large_files".to_string(),
+            args: json!({"threshold_mb": 100, "limit": 10, "extra": "x"}),
+            result: "找到了 12 个大文件".to_string(),
+            ok: true,
+        };
+        let s = format_trace_brief(&t);
+        assert!(s.starts_with("list_large_files("));
+        assert!(s.contains("threshold_mb=100"));
+        assert!(s.contains("✓"));
+        assert!(s.contains("找到了 12 个大文件"));
+        assert!(s.len() < 180, "过长：{}", s);
     }
 
     #[test]

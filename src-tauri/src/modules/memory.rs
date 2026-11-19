@@ -181,7 +181,40 @@ async fn embed_text(text: &str) -> Result<Vec<f32>, String> {
     Ok(arr.iter().map(|v| v.as_f64().unwrap_or(0.0) as f32).collect())
 }
 
-fn cosine_sim(a: &[f32], b: &[f32]) -> f32 {
+/// 批量 embedding：一次 HTTP 请求拿到多条文本的向量，供经验检索等场景复用。
+/// Ollama /api/embed 的 input 支持字符串数组，响应 embeddings 为二维数组。
+pub(crate) async fn embed_texts_batch(texts: &[String]) -> Result<Vec<Vec<f32>>, String> {
+    if texts.is_empty() { return Ok(Vec::new()); }
+    let url = format!("{}/api/embed", ollama_url());
+    let body = serde_json::json!({
+        "model": "bge-m3",
+        "input": texts
+    });
+    let resp = crate::modules::local_http_client()
+        .post(&url)
+        .header("Content-Type", "application/json")
+        .timeout(std::time::Duration::from_secs(30))
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    if !resp.status().is_success() {
+        return Err(format!("embed error HTTP {}", resp.status()));
+    }
+    let json: serde_json::Value = resp.json().await.map_err(|e| format!("embed parse: {}", e))?;
+    let arrs = json.get("embeddings")
+        .and_then(|v| v.as_array())
+        .ok_or("missing 'embeddings' field".to_string())?;
+    if arrs.len() != texts.len() {
+        return Err(format!("embedding 数量不匹配：期望 {}，实际 {}", texts.len(), arrs.len()));
+    }
+    Ok(arrs.iter().map(|a| {
+        a.as_array().map(|v| v.iter().map(|x| x.as_f64().unwrap_or(0.0) as f32).collect())
+            .unwrap_or_default()
+    }).collect())
+}
+
+pub(crate) fn cosine_sim(a: &[f32], b: &[f32]) -> f32 {
     let dot: f32 = a.iter().zip(b.iter()).map(|(x,y)| x*y).sum();
     let na: f32 = a.iter().map(|x| x*x).sum::<f32>().sqrt();
     let nb: f32 = b.iter().map(|x| x*x).sum::<f32>().sqrt();
