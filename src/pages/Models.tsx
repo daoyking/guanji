@@ -23,11 +23,38 @@ const STATUS_ERROR = 'error' as const;
 
 type PullStatus = typeof STATUS_IDLE | typeof STATUS_PULLING | typeof STATUS_DONE | typeof STATUS_ERROR;
 
+interface Provider {
+  id: string;
+  name: string;
+  base_url: string;
+  api_key: string;
+  enabled: boolean;
+}
+
+// 常见 OpenAI 兼容服务的预设（base_url 填到 /v1 一级）
+const PROVIDER_PRESETS: { name: string; base_url: string; hint: string }[] = [
+  { name: 'DeepSeek', base_url: 'https://api.deepseek.com/v1', hint: 'deepseek-chat / deepseek-reasoner' },
+  { name: 'OpenAI', base_url: 'https://api.openai.com/v1', hint: 'gpt-4o-mini / gpt-4o' },
+  { name: '通义千问', base_url: 'https://dashscope.aliyuncs.com/compatible-mode/v1', hint: 'qwen-plus / qwen-turbo' },
+  { name: 'Kimi', base_url: 'https://api.moonshot.cn/v1', hint: 'moonshot-v1-8k' },
+  { name: '智谱 GLM', base_url: 'https://open.bigmodel.cn/api/paas/v4', hint: 'glm-4-flash / glm-4' },
+  { name: 'OrcaRouter(本机)', base_url: 'http://localhost:7001/v1', hint: '本机聚合网关' },
+];
+
+const emptyProvider = { name: '', base_url: '', api_key: '' };
+
 export default function Models() {
   const [models, setModels] = useState<OllamaModel[]>([]);
   const [loading, setLoading] = useState(false);
   const [ollamaStatus, setOllamaStatus] = useState<'ok' | 'offline' | 'checking'>('checking');
   const [pullInput, setPullInput] = useState('');
+  // 云模型服务
+  const [providers, setProviders] = useState<Provider[]>([]);
+  const [providerForm, setProviderForm] = useState({ ...emptyProvider });
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [providerMsg, setProviderMsg] = useState('');
+  const [testingId, setTestingId] = useState<string | null>(null);
+  const [providerModels, setProviderModels] = useState<Record<string, string[]>>({});
   const [pullStatus, setPullStatus] = useState<{name: string; status: PullStatus; message: string}>({
     name: '',
     status: STATUS_IDLE,
@@ -48,8 +75,73 @@ export default function Models() {
     }
   };
 
+  // ── 云模型服务 ──
+  const loadProviders = async () => {
+    try {
+      setProviders(await invoke<Provider[]>('provider_list'));
+    } catch (e) {
+      setProviderMsg(`加载服务商失败：${String(e)}`);
+    }
+  };
+
+  const applyPreset = (preset: typeof PROVIDER_PRESETS[number]) => {
+    setProviderForm({ name: preset.name, base_url: preset.base_url, api_key: '' });
+    setProviderMsg(`已填入 ${preset.name} 配置，常见模型：${preset.hint}`);
+    setEditingId(null);
+  };
+
+  const saveProvider = async () => {
+    const { name, base_url, api_key } = providerForm;
+    if (!name.trim() || !base_url.trim()) {
+      setProviderMsg('✗ 名称与 Base URL 不能为空');
+      return;
+    }
+    try {
+      await invoke('provider_save', { id: editingId, name, baseUrl: base_url, apiKey: api_key, enabled: true });
+      setProviderForm({ ...emptyProvider });
+      setEditingId(null);
+      setProviderMsg(`✓ 已保存服务商「${name}」`);
+      await loadProviders();
+    } catch (e) {
+      setProviderMsg(`✗ 保存失败：${String(e)}`);
+    }
+  };
+
+  const editProvider = (p: Provider) => {
+    setProviderForm({ name: p.name, base_url: p.base_url, api_key: p.api_key });
+    setEditingId(p.id);
+    setProviderMsg('');
+  };
+
+  const removeProvider = async (p: Provider) => {
+    if (!confirm(`确定删除云模型服务「${p.name}」吗？\n\n注意：若当前对话模型来自该服务，需重新选择模型。`)) return;
+    try {
+      const msg = await invoke<string>('provider_delete', { id: p.id });
+      setProviderMsg(`✓ ${msg}`);
+      setProviderModels((prev) => { const n = { ...prev }; delete n[p.id]; return n; });
+      await loadProviders();
+    } catch (e) {
+      setProviderMsg(`✗ 删除失败：${String(e)}`);
+    }
+  };
+
+  const testProvider = async (p: Provider) => {
+    setTestingId(p.id);
+    setProviderMsg(`正在测试「${p.name}」并拉取模型列表…`);
+    try {
+      const ids = await invoke<string[]>('provider_list_models', { id: p.id });
+      setProviderModels((prev) => ({ ...prev, [p.id]: ids }));
+      setProviderMsg(`✓ 「${p.name}」连接成功，发现 ${ids.length} 个模型`);
+    } catch (e) {
+      setProviderMsg(`✗ 「${p.name}」连接失败：${String(e)}`);
+    } finally {
+      setTestingId(null);
+    }
+  };
+
   useEffect(() => {
     loadModels();
+    loadProviders();
   }, []);
 
   const handlePull = async () => {
@@ -126,6 +218,95 @@ export default function Models() {
           </p>
         </div>
       </div>
+
+      {/* Cloud Model Providers */}
+      <section className="bg-white dark:bg-gray-800 rounded-xl p-6 card-shadow">
+        <div className="flex items-center justify-between mb-1">
+          <h3 className="text-lg font-medium text-gray-900 dark:text-white">☁️ 云模型服务</h3>
+          <span className="text-xs text-gray-400">OpenAI 兼容协议</span>
+        </div>
+        <p className="text-xs text-gray-500 dark:text-gray-400 mb-4">
+          添加云服务商后，可在「AI 管家」的模型选择器里切换到云端模型对话。API Key 仅保存在本机数据库。
+        </p>
+
+        {/* 预设快捷 */}
+        <div className="mb-4">
+          <p className="text-xs text-gray-500 dark:text-gray-400 mb-2">快速填入：</p>
+          <div className="flex flex-wrap gap-2">
+            {PROVIDER_PRESETS.map((preset) => (
+              <button key={preset.name} onClick={() => applyPreset(preset)}
+                className="px-3 py-1 text-xs bg-gray-100 dark:bg-gray-700 text-gray-600 dark:text-gray-300 rounded-full hover:bg-purple-100 dark:hover:bg-purple-900/30 hover:text-purple-700 dark:hover:text-purple-400 transition-colors">
+                + {preset.name}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        {/* 配置表单 */}
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-3 mb-3">
+          <input value={providerForm.name} onChange={e => setProviderForm({ ...providerForm, name: e.target.value })}
+            placeholder="服务商名称，如 DeepSeek"
+            className="px-3 py-2 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-sm text-gray-900 dark:text-white placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-purple-500" />
+          <input value={providerForm.base_url} onChange={e => setProviderForm({ ...providerForm, base_url: e.target.value })}
+            placeholder="Base URL，如 https://api.deepseek.com/v1"
+            className="px-3 py-2 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-sm text-gray-900 dark:text-white placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-purple-500" />
+          <input value={providerForm.api_key} onChange={e => setProviderForm({ ...providerForm, api_key: e.target.value })}
+            type="password" placeholder="API Key（可选，本机服务可留空）"
+            className="px-3 py-2 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-sm text-gray-900 dark:text-white placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-purple-500" />
+        </div>
+        <div className="flex gap-2 mb-3">
+          <button onClick={saveProvider} className="px-5 py-2 bg-purple-600 text-white rounded-lg hover:bg-purple-700 text-sm font-medium">
+            {editingId ? '保存修改' : '添加服务'}
+          </button>
+          {editingId && <button onClick={() => { setEditingId(null); setProviderForm({ ...emptyProvider }); }} className="px-4 py-2 bg-gray-200 dark:bg-gray-600 text-gray-700 dark:text-gray-200 rounded-lg text-sm">取消编辑</button>}
+        </div>
+
+        {/* 已配置列表 */}
+        {providers.length > 0 && (
+          <div className="mt-4 space-y-2">
+            <p className="text-xs text-gray-500 dark:text-gray-400">已配置 {providers.length} 个服务：</p>
+            {providers.map(p => (
+              <div key={p.id} className={`rounded-lg border px-3 py-2.5 ${p.enabled ? 'border-gray-200 dark:border-gray-600 bg-gray-50 dark:bg-gray-700/40' : 'border-gray-200 dark:border-gray-700 opacity-60'}`}>
+                <div className="flex items-center justify-between gap-3 flex-wrap">
+                  <div className="min-w-0 flex-1">
+                    <div className="flex items-center gap-2">
+                      <span className="text-sm font-medium text-gray-900 dark:text-white">{p.name}</span>
+                      <span className={`text-[10px] px-1.5 py-0.5 rounded-full ${p.enabled ? 'bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-400' : 'bg-gray-200 text-gray-600'}`}>
+                        {p.enabled ? '已启用' : '已停用'}
+                      </span>
+                    </div>
+                    <p className="text-[11px] text-gray-500 dark:text-gray-400 truncate mt-0.5" title={p.base_url}>{p.base_url}</p>
+                    <p className="text-[11px] text-gray-400 mt-0.5">Key: {p.api_key ? '••••' + p.api_key.slice(-4) : '未设置'}</p>
+                  </div>
+                  <div className="flex items-center gap-2 shrink-0">
+                    <button onClick={() => testProvider(p)} disabled={testingId !== null}
+                      className="text-xs px-2.5 py-1 rounded border border-purple-300 dark:border-purple-700 text-purple-600 dark:text-purple-400 hover:bg-purple-50 dark:hover:bg-purple-900/20 disabled:opacity-50">
+                      {testingId === p.id ? '测试中…' : '测试并列出模型'}
+                    </button>
+                    <button onClick={() => editProvider(p)} className="text-xs px-2 py-1 text-gray-500 hover:text-blue-600">编辑</button>
+                    <button onClick={() => removeProvider(p)} className="text-xs px-2 py-1 text-gray-500 hover:text-red-600">删除</button>
+                  </div>
+                </div>
+                {providerModels[p.id] && (
+                  <div className="mt-2 flex flex-wrap gap-1.5">
+                    {providerModels[p.id].length === 0 ? (
+                      <span className="text-[11px] text-gray-400">未返回模型</span>
+                    ) : providerModels[p.id].map(id => (
+                      <span key={id} className="text-[10px] px-1.5 py-0.5 bg-purple-50 dark:bg-purple-900/20 text-purple-700 dark:text-purple-400 rounded font-mono">{id}</span>
+                    ))}
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
+
+        {providerMsg && (
+          <div className={`mt-3 p-2.5 rounded-lg text-xs ${providerMsg.startsWith('✓') ? 'bg-green-50 dark:bg-green-900/20 text-green-700 dark:text-green-400' : providerMsg.startsWith('✗') ? 'bg-red-50 dark:bg-red-900/20 text-red-700 dark:text-red-400' : 'bg-blue-50 dark:bg-blue-900/20 text-blue-700 dark:text-blue-400'} break-all`}>
+            {providerMsg}
+          </div>
+        )}
+      </section>
 
       {/* Pull New Model */}
       <section className="bg-white dark:bg-gray-800 rounded-xl p-6 card-shadow">

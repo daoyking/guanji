@@ -22,6 +22,9 @@ interface Message {
 }
 interface LocalModel {
   name: string;
+  ref: string;       // provider::model，用于探活/切换
+  source: string;    // 来源显示名：本机 Ollama / 云服务商名
+  kind: 'local' | 'cloud' | 'error';
   size: number;
   current: boolean;
 }
@@ -130,43 +133,43 @@ export default function AgentChat() {
       try {
         const list = await invoke<LocalModel[]>('agent_list_models');
         setModels(list);
-        if (list.length === 0) setModelMsg('未检测到本机模型，请确认 Ollama 已启动并已安装模型');
+        if (list.length === 0) setModelMsg('未检测到模型，请启动 Ollama 或在「模型管家」添加云模型服务');
       } catch (e) {
         setModelMsg(`加载模型列表失败：${String(e)}`);
       }
     }
   };
 
-  // 探活单个模型（真发请求验证能否使用）
-  const probe = async (name: string): Promise<ModelProbe> => {
-    setProbing(name);
+  // 探活单个模型（真发请求验证能否使用）。key 用 ref 区分同名模型
+  const probe = async (ref: string): Promise<ModelProbe> => {
+    setProbing(ref);
     try {
-      const result = await invoke<ModelProbe>('agent_probe_model', { model: name });
-      setProbeCache((prev) => ({ ...prev, [name]: result }));
+      const result = await invoke<ModelProbe>('agent_probe_model', { model: ref });
+      setProbeCache((prev) => ({ ...prev, [ref]: result }));
       return result;
     } catch (e) {
-      const fail: ModelProbe = { model: name, ok: false, latency_ms: 0, detail: String(e) };
-      setProbeCache((prev) => ({ ...prev, [name]: fail }));
+      const fail: ModelProbe = { model: ref, ok: false, latency_ms: 0, detail: String(e) };
+      setProbeCache((prev) => ({ ...prev, [ref]: fail }));
       return fail;
     } finally {
       setProbing(null);
     }
   };
 
-  // 选择模型：先探活，通过才切换并持久化
-  const chooseModel = async (name: string) => {
-    if (name === model) return;
+  // 选择模型：先探活，通过才切换并持久化。后端返回 model 名供显示
+  const chooseModel = async (m: LocalModel) => {
+    if (m.current || m.kind === 'error') return;
     setModelMsg('正在验证模型可用性…');
-    const result = await probe(name);
+    const result = await probe(m.ref);
     if (!result.ok) {
-      setModelMsg(`✗ ${name} 不可用：${result.detail}`);
+      setModelMsg(`✗ ${m.name} 不可用：${result.detail}`);
       return;
     }
     try {
-      await invoke<ModelProbe>('agent_set_model', { model: name });
-      setModel(name);
-      setModels((prev) => prev.map((m) => ({ ...m, current: m.name === name })));
-      setModelMsg(`✓ 已切换到 ${name}（${result.latency_ms}ms）`);
+      const saved = await invoke<ModelProbe>('agent_set_model', { model: m.ref });
+      setModel(saved.model.includes('::') ? saved.model.split('::').slice(1).join('::') : saved.model);
+      setModels((prev) => prev.map((x) => ({ ...x, current: x.ref === m.ref })));
+      setModelMsg(`✓ 已切换到 ${m.name}（${result.latency_ms}ms）`);
     } catch (e) {
       setModelMsg(`切换失败：${String(e)}`);
     }
@@ -274,28 +277,36 @@ export default function AgentChat() {
                 <span className="text-sm font-medium text-gray-800 dark:text-gray-200">选择对话模型</span>
                 <button onClick={() => setModelOpen(false)} className="text-gray-400 hover:text-gray-600 dark:hover:text-gray-200 text-lg leading-none">×</button>
               </div>
-              <p className="text-[11px] text-gray-400 mb-2">选择时会自动检测模型在本机是否可用</p>
+              <p className="text-[11px] text-gray-400 mb-2">本机 Ollama + 已配置的云模型，选中会自动验证可用性</p>
 
               <div className="space-y-1.5 max-h-64 overflow-y-auto">
                 {models.map((m) => {
-                  const pr = probeCache[m.name];
+                  const pr = probeCache[m.ref];
+                  const isErr = m.kind === 'error';
                   return (
-                    <div key={m.name} className={`rounded-lg border px-2.5 py-2 ${
+                    <div key={m.ref} className={`rounded-lg border px-2.5 py-2 ${
                       m.current ? 'border-green-400 bg-green-50 dark:bg-green-900/20' : 'border-gray-200 dark:border-gray-700'
                     }`}>
                       <div className="flex items-center justify-between gap-2">
-                        <button onClick={() => chooseModel(m.name)} disabled={probing !== null || m.current}
+                        <button onClick={() => chooseModel(m)} disabled={probing !== null || m.current || isErr}
                           className="flex-1 text-left min-w-0 disabled:cursor-default">
                           <div className="flex items-center gap-1.5">
+                            <span className={`text-[10px] px-1.5 py-0.5 rounded-full shrink-0 ${m.kind === 'cloud' ? 'bg-purple-100 text-purple-700 dark:bg-purple-900/30 dark:text-purple-400' : m.kind === 'local' ? 'bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-400' : 'bg-red-100 text-red-700'}`}>
+                              {m.kind === 'cloud' ? '☁ 云' : m.kind === 'local' ? '本机' : '错误'}
+                            </span>
                             <span className="text-xs font-mono text-gray-800 dark:text-gray-200 truncate">{m.name}</span>
                             {m.current && <span className="text-[10px] px-1.5 py-0.5 bg-green-500 text-white rounded-full shrink-0">当前</span>}
                           </div>
-                          <div className="text-[10px] text-gray-400 mt-0.5">{(m.size / 1e9).toFixed(1)} GB</div>
+                          <div className="text-[10px] text-gray-400 mt-0.5">
+                            {m.source}{m.size > 0 ? ` · ${(m.size / 1e9).toFixed(1)} GB` : ''}
+                          </div>
                         </button>
-                        <button onClick={() => probe(m.name)} disabled={probing !== null}
-                          className="shrink-0 text-[11px] px-2 py-1 rounded border border-gray-300 dark:border-gray-600 text-gray-600 dark:text-gray-300 hover:border-blue-400 hover:text-blue-600 disabled:opacity-50">
-                          {probing === m.name ? '检测中…' : '检测'}
-                        </button>
+                        {!isErr && (
+                          <button onClick={() => probe(m.ref)} disabled={probing !== null}
+                            className="shrink-0 text-[11px] px-2 py-1 rounded border border-gray-300 dark:border-gray-600 text-gray-600 dark:text-gray-300 hover:border-blue-400 hover:text-blue-600 disabled:opacity-50">
+                            {probing === m.ref ? '检测中…' : '检测'}
+                          </button>
+                        )}
                       </div>
                       {pr && (
                         <div className={`mt-1.5 text-[10px] ${pr.ok ? 'text-green-600 dark:text-green-400' : 'text-red-500'} break-all`}>
@@ -305,6 +316,7 @@ export default function AgentChat() {
                     </div>
                   );
                 })}
+                {models.length === 0 && <p className="text-xs text-gray-400 text-center py-4">未检测到任何模型</p>}
               </div>
               {modelMsg && (
                 <div className={`mt-2 text-[11px] ${modelMsg.startsWith('✓') ? 'text-green-600 dark:text-green-400' : modelMsg.startsWith('✗') ? 'text-red-500' : 'text-gray-500'} break-all`}>

@@ -10,6 +10,7 @@ pub mod agent;
 pub mod shell;
 pub mod reminder;
 pub mod chat;
+pub mod provider;
 pub mod apps;
 
 use std::fs;

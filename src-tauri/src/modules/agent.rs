@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter};
 use crate::db::with_db;
+use crate::modules::provider::{self, Provider, LOCAL_PROVIDER_ID};
 
 const MAX_STEPS: usize = 8;
 
@@ -18,11 +19,23 @@ fn ollama_http_client() -> reqwest::Client {
 }
 
 const MODEL_PREF_KEY: &str = "agent_model";
-const DEFAULT_MODEL: &str = "qwen2.5-coder:7b";
+const DEFAULT_REF: &str = "ollama::qwen2.5-coder:7b";
 
-/// 当前 Agent 使用的模型：优先用户在界面选择的偏好（SQLite），
-/// 其次环境变量，最后默认值。偏好存 SQLite 以便跨重启保持。
-fn agent_model() -> String {
+/// 模型引用格式：`provider_id::model_name`。无 `::` 的旧值视为本地 Ollama（向后兼容）。
+fn parse_model_ref(s: &str) -> (String, String) {
+    if let Some((p, m)) = s.split_once("::") {
+        (p.to_string(), m.to_string())
+    } else {
+        (LOCAL_PROVIDER_ID.to_string(), s.to_string())
+    }
+}
+
+fn make_ref(provider_id: &str, model: &str) -> String {
+    format!("{}::{}", provider_id, model)
+}
+
+/// 当前 Agent 使用的完整模型引用（含 provider 前缀）
+fn model_ref() -> String {
     let stored = std::thread::spawn(|| {
         with_db(|conn| {
             conn.query_row(
@@ -38,7 +51,29 @@ fn agent_model() -> String {
     stored
         .filter(|s| !s.trim().is_empty())
         .or_else(|| std::env::var("GUANJI_AGENT_MODEL").ok())
-        .unwrap_or_else(|| DEFAULT_MODEL.to_string())
+        .unwrap_or_else(|| DEFAULT_REF.to_string())
+}
+
+/// 当前 Agent 使用的模型名（不含 provider 前缀）—— 供显示与请求 body 使用
+fn agent_model() -> String {
+    parse_model_ref(&model_ref()).1
+}
+
+/// 读取 provider 配置（本地 Ollama 用占位，云 provider 从库里取）
+fn resolve_provider(provider_id: &str) -> Result<Provider, String> {
+    if provider_id == LOCAL_PROVIDER_ID {
+        return Ok(Provider {
+            id: LOCAL_PROVIDER_ID.to_string(),
+            name: "本机 Ollama".into(),
+            base_url: ollama_url(),
+            api_key: String::new(),
+            enabled: true,
+        });
+    }
+    provider::provider_list()?
+        .into_iter()
+        .find(|p| p.id == provider_id)
+        .ok_or_else(|| format!("服务商 {} 已不存在，请重新选择模型", provider_id))
 }
 
 // ─── 对外数据结构 ──────────────────────────────────────────────
@@ -268,25 +303,100 @@ fn system_prompt(successes: &[String], failures: &[String]) -> String {
 
 // ─── Ollama 调用 ───────────────────────────────────────────────
 
-async fn chat_with_ollama(messages: Vec<Value>) -> Result<Value, String> {
-    let url = format!("{}/api/chat", ollama_url());
-    let body = json!({
-        "model": agent_model(),
-        "messages": messages,
-        "stream": false,
-        "options": {"temperature": 0.1, "num_predict": 512}
-    });
-    let resp = ollama_http_client()
-        .post(&url)
-        .json(&body)
-        .timeout(std::time::Duration::from_secs(120))
-        .send()
-        .await
-        .map_err(|e| format!("Ollama 请求失败（请确认 Ollama 已启动）: {}", e))?;
-    if !resp.status().is_success() {
-        return Err(format!("Ollama HTTP {}", resp.status()));
+/// 统一聊天调用：返回 {content, tool_calls}，屏蔽 Ollama / OpenAI 兼容协议的响应差异。
+/// - 本地 Ollama：POST {base}/api/chat，响应 message.content + message.tool_calls
+/// - 云 provider：POST {base}/chat/completions（Bearer key），响应 choices[0].message
+async fn chat_complete(messages: Vec<Value>) -> Result<Value, String> {
+    let (provider_id, model) = parse_model_ref(&model_ref());
+    let p = resolve_provider(&provider_id)?;
+    let tools = tools_schema();
+
+    if p.id == LOCAL_PROVIDER_ID {
+        // ── 本机 Ollama 原生协议 ──
+        let url = format!("{}/api/chat", provider::normalize_base_url(&p.base_url));
+        let body = json!({
+            "model": model,
+            "messages": messages,
+            "stream": false,
+            "tools": tools,
+            "options": {"temperature": 0.1, "num_predict": 512}
+        });
+        let resp = ollama_http_client()
+            .post(&url)
+            .json(&body)
+            .timeout(std::time::Duration::from_secs(120))
+            .send()
+            .await
+            .map_err(|e| format!("Ollama 请求失败（请确认 Ollama 已启动）: {}", e))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            return Err(format!("Ollama HTTP {}: {}", status, text.chars().take(160).collect::<String>()));
+        }
+        let body: Value = resp.json().await.map_err(|e| format!("解析响应失败: {}", e))?;
+        let msg = body["message"].clone();
+        Ok(json!({
+            "content": msg["content"].as_str().unwrap_or(""),
+            "tool_calls": normalize_tool_calls(msg["tool_calls"].as_array(), false),
+        }))
+    } else {
+        // ── OpenAI 兼容协议（云模型）──
+        let url = provider::api_url(&p.base_url, "chat/completions");
+        let body = json!({
+            "model": model,
+            "messages": messages,
+            "stream": false,
+            "tools": tools,
+            "tool_choice": "auto",
+            "temperature": 0.1,
+            "max_tokens": 1024
+        });
+        let mut req = provider::cloud_http_client()
+            .post(&url)
+            .json(&body)
+            .timeout(std::time::Duration::from_secs(120));
+        if !p.api_key.trim().is_empty() {
+            req = req.bearer_auth(p.api_key.trim());
+        }
+        let resp = req.send().await.map_err(|e| format!("{} 请求失败: {}", p.name, e))?;
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return Err(format!("{} HTTP {}: {}", p.name, status, text.chars().take(300).collect::<String>()));
+        }
+        let v: Value = serde_json::from_str(&text).map_err(|e| format!("响应解析失败：{}", e))?;
+        let msg = &v["choices"][0]["message"];
+        if msg.is_null() {
+            return Err(format!("响应缺少 choices[0].message：{}", text.chars().take(200).collect::<String>()));
+        }
+        Ok(json!({
+            "content": msg["content"].as_str().unwrap_or(""),
+            // OpenAI 的 arguments 是 JSON 字符串，需解析为对象
+            "tool_calls": normalize_tool_calls(msg["tool_calls"].as_array(), true),
+        }))
     }
-    resp.json::<Value>().await.map_err(|e| format!("解析响应失败: {}", e))
+}
+
+/// 把两种协议的 tool_calls 统一成 [{function:{name, arguments: Value}}]
+fn normalize_tool_calls(calls: Option<&Vec<Value>>, openai_style: bool) -> Vec<Value> {
+    let mut out = Vec::new();
+    if let Some(calls) = calls {
+        for c in calls {
+            let f = &c["function"];
+            let name = f["name"].as_str().unwrap_or("").to_string();
+            if name.is_empty() { continue; }
+            let args: Value = if openai_style {
+                match f["arguments"].as_str() {
+                    Some(s) if !s.trim().is_empty() => serde_json::from_str(s).unwrap_or_else(|_| json!({})),
+                    _ => f["arguments"].clone(),
+                }
+            } else {
+                f["arguments"].clone()
+            };
+            out.push(json!({"function": {"name": name, "arguments": args}}));
+        }
+    }
+    out
 }
 
 /// 兼容三种工具调用输出，统一解析为 (tool_name, args) 或最终答案
@@ -544,10 +654,9 @@ pub async fn agent_chat(app: AppHandle, message: String, history: Option<Vec<Val
     let mut traces: Vec<ToolTrace> = Vec::new();
 
     for step in 1..=MAX_STEPS {
-        let resp = chat_with_ollama(messages.clone()).await?;
-        let msg = resp["message"].clone();
-        let content = msg["content"].as_str().unwrap_or("").to_string();
-        let native = msg["tool_calls"].as_array().cloned();
+        let resp = chat_complete(messages.clone()).await?;
+        let content = resp["content"].as_str().unwrap_or("").to_string();
+        let native = resp["tool_calls"].as_array().cloned();
 
         let (tool_name, args, answer) = parse_model_output(&content, native.as_ref())?;
 
@@ -599,11 +708,13 @@ pub async fn agent_chat(app: AppHandle, message: String, history: Option<Vec<Val
             "result": result_short, "elapsed_ms": elapsed_ms
         }));
 
-        // 把工具结果回填给模型，继续迭代
-        messages.push(json!({"role": "assistant", "content": content}));
+        // 把工具结果回填给模型，继续迭代。
+        // 用 user 角色 + 明确标记，而非 role:tool——后者在 OpenAI 协议下要求与上一条
+        // assistant.tool_calls 用 tool_call_id 严格配对，云模型若以文本输出工具调用会 400。
+        // 文本回填对本地 Ollama 与所有 OpenAI 兼容端点都安全。
         messages.push(json!({
-            "role": "tool",
-            "content": format!("工具 {} 执行{}: {}", name, if ok {"成功"} else {"失败"}, result_short)
+            "role": "user",
+            "content": format!("[工具结果] 工具 {} 执行{}：{}", name, if ok {"成功"} else {"失败"}, result_short)
         }));
     }
 
@@ -628,82 +739,124 @@ pub struct ModelProbe {
     pub detail: String,
 }
 
-/// 探活：真发一次极简 chat 请求验证模型在本机能否正常工作。
-/// 只查 /api/tags 列表是不够的——模型可能已损坏、正在加载失败、或是 embedding 模型无法对话。
-async fn probe_model(model: &str) -> ModelProbe {
-    let url = format!("{}/api/chat", ollama_url());
-    let body = json!({
-        "model": model,
-        "messages": [{"role": "user", "content": "hi"}],
-        "stream": false,
-        "options": {"num_predict": 1, "temperature": 0}
-    });
+/// 探活：真发一次极简 chat 请求验证模型能否正常工作。
+/// `model_ref` 为 `provider_id::model_name` 复合引用（纯模型名视为本地 Ollama）。
+async fn probe_model(model_ref: &str) -> ModelProbe {
+    let (provider_id, model) = parse_model_ref(model_ref);
+    let p = match resolve_provider(&provider_id) {
+        Ok(p) => p,
+        Err(e) => return ModelProbe {
+            model: model_ref.to_string(), ok: false, latency_ms: 0, detail: e,
+        },
+    };
+    let is_local = p.id == LOCAL_PROVIDER_ID;
+    let (url, body, bearer) = if is_local {
+        (
+            format!("{}/api/chat", provider::normalize_base_url(&p.base_url)),
+            json!({"model": model, "messages": [{"role":"user","content":"hi"}], "stream": false, "options": {"num_predict": 1, "temperature": 0}}),
+            String::new(),
+        )
+    } else {
+        (
+            provider::api_url(&p.base_url, "chat/completions"),
+            json!({"model": model, "messages": [{"role":"user","content":"hi"}], "stream": false, "max_tokens": 1, "temperature": 0}),
+            p.api_key.trim().to_string(),
+        )
+    };
+
     let started = std::time::Instant::now();
     let latency = || started.elapsed().as_millis() as u64;
+    let mut req = if is_local { ollama_http_client() } else { provider::cloud_http_client() }
+        .post(&url).json(&body).timeout(std::time::Duration::from_secs(60));
+    if !bearer.is_empty() { req = req.bearer_auth(&bearer); }
 
-    let resp = match ollama_http_client()
-        .post(&url)
-        .json(&body)
-        .timeout(std::time::Duration::from_secs(60))
-        .send()
-        .await
-    {
+    let resp = match req.send().await {
         Ok(r) => r,
         Err(e) => return ModelProbe {
-            model: model.to_string(), ok: false, latency_ms: latency(),
-            detail: format!("无法连接 Ollama：{}（请确认 Ollama 已启动）", e),
+            model: model_ref.to_string(), ok: false, latency_ms: latency(),
+            detail: format!("无法连接 {}：{}", p.name, e),
         },
     };
     let status = resp.status();
     let text = resp.text().await.unwrap_or_default();
     if !status.is_success() {
-        let reason = if status.as_u16() == 404 {
-            "模型不存在或已被删除".to_string()
+        let reason = if status.as_u16() == 404 || status.as_u16() == 400 {
+            format!("模型不存在或不被接受（HTTP {}）：{}", status, text.chars().take(120).collect::<String>())
         } else {
-            format!("Ollama 返回 HTTP {}", status)
+            format!("{} 返回 HTTP {}：{}", p.name, status, text.chars().take(120).collect::<String>())
         };
-        return ModelProbe { model: model.to_string(), ok: false, latency_ms: latency(), detail: reason };
+        return ModelProbe { model: model_ref.to_string(), ok: false, latency_ms: latency(), detail: reason };
     }
-    match serde_json::from_str::<Value>(&text) {
-        Ok(v) if v.get("message").is_some() || v.get("response").is_some() => ModelProbe {
-            model: model.to_string(), ok: true, latency_ms: latency(),
-            detail: "可用 · 响应正常".to_string(),
-        },
-        Ok(v) => ModelProbe {
-            model: model.to_string(), ok: false, latency_ms: latency(),
-            detail: format!("响应格式异常：{}", v.to_string().chars().take(80).collect::<String>()),
-        },
-        Err(_) => ModelProbe {
-            model: model.to_string(), ok: false, latency_ms: latency(),
-            detail: "响应解析失败".to_string(),
-        },
+    if is_local {
+        match serde_json::from_str::<Value>(&text) {
+            Ok(v) if v.get("message").is_some() || v.get("response").is_some() => ModelProbe {
+                model: model_ref.to_string(), ok: true, latency_ms: latency(), detail: "可用 · 响应正常".into(),
+            },
+            Ok(v) => ModelProbe {
+                model: model_ref.to_string(), ok: false, latency_ms: latency(),
+                detail: format!("响应格式异常：{}", v.to_string().chars().take(80).collect::<String>()),
+            },
+            Err(_) => ModelProbe { model: model_ref.to_string(), ok: false, latency_ms: latency(), detail: "响应解析失败".into() },
+        }
+    } else {
+        match serde_json::from_str::<Value>(&text) {
+            Ok(v) if v.get("choices").and_then(|c| c.as_array()).map(|a| !a.is_empty()).unwrap_or(false) => ModelProbe {
+                model: model_ref.to_string(), ok: true, latency_ms: latency(), detail: "可用 · 响应正常".into(),
+            },
+            Ok(v) => ModelProbe {
+                model: model_ref.to_string(), ok: false, latency_ms: latency(),
+                detail: format!("响应格式异常：{}", v.to_string().chars().take(120).collect::<String>()),
+            },
+            Err(_) => ModelProbe { model: model_ref.to_string(), ok: false, latency_ms: latency(), detail: "响应解析失败".into() },
+        }
     }
 }
 
-/// 列出本机 Ollama 模型，带大小信息（可用性由前端按需逐个探活，避免并发加载多个大模型）
+/// 列出所有可用模型：本机 Ollama + 所有启用的云 provider。
+/// 每项含 `ref`（provider::model，用于探活/设置）、`source`（本机/云服务商名）、`size`。
+/// 可用性由前端按需逐个探活，避免并发加载多个大模型或触发大量云请求。
 #[tauri::command]
 pub async fn agent_list_models() -> Result<Vec<Value>, String> {
+    let current_ref = model_ref();
+    let mut out: Vec<Value> = Vec::new();
+
+    // 1) 本机 Ollama
     let url = format!("{}/api/tags", ollama_url());
-    let resp = ollama_http_client()
-        .get(&url)
-        .timeout(std::time::Duration::from_secs(10))
-        .send()
-        .await
-        .map_err(|e| format!("无法连接 Ollama：{}", e))?;
-    if !resp.status().is_success() {
-        return Err(format!("Ollama HTTP {}", resp.status()));
+    if let Ok(resp) = ollama_http_client().get(&url).timeout(std::time::Duration::from_secs(8)).send().await {
+        if resp.status().is_success() {
+            if let Ok(body) = resp.json::<Value>().await {
+                let models = body.get("models").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+                for m in models {
+                    let name = m["name"].as_str().unwrap_or("").to_string();
+                    if name.is_empty() { continue; }
+                    let r = make_ref(LOCAL_PROVIDER_ID, &name);
+                    out.push(json!({
+                        "name": name, "ref": r, "source": "本机 Ollama", "kind": "local",
+                        "size": m["size"].as_u64().unwrap_or(0), "current": r == current_ref,
+                    }));
+                }
+            }
+        }
     }
-    let body: Value = resp.json().await.map_err(|e| e.to_string())?;
-    let current = agent_model();
-    let models = body.get("models").and_then(|v| v.as_array()).cloned().unwrap_or_default();
-    let out: Vec<Value> = models.into_iter().map(|m| {
-        let name = m["name"].as_str().unwrap_or("").to_string();
-        json!({
-            "name": name,
-            "size": m["size"].as_u64().unwrap_or(0),
-            "current": name == current,
-        })
-    }).collect();
+
+    // 2) 云 providers（顺序拉取，单个失败不影响其它；provider 数量少，无需并发）
+    let providers: Vec<Provider> = provider::provider_list()?.into_iter().filter(|p| p.enabled).collect();
+    for p in &providers {
+        match provider::fetch_cloud_models(&p.base_url, &p.api_key).await {
+            Ok(ids) => for name in ids {
+                let r = make_ref(&p.id, &name);
+                out.push(json!({
+                    "name": name, "ref": r, "source": p.name.clone(), "kind": "cloud",
+                    "size": 0, "current": r == current_ref,
+                }));
+            },
+            Err(e) => out.push(json!({
+                "name": format!("⚠️ 连接失败：{}", e.chars().take(50).collect::<String>()),
+                "ref": make_ref(&p.id, ""), "source": p.name.clone(), "kind": "error",
+                "size": 0, "current": false,
+            })),
+        }
+    }
     Ok(out)
 }
 
@@ -842,4 +995,38 @@ mod tests {
         let v: Value = serde_json::from_str(&obj).unwrap();
         assert_eq!(v["arguments"]["a"]["b"], 1);
     }
+
+    #[test]
+    fn model_ref_parse_roundtrip() {
+        assert_eq!(parse_model_ref("ollama::qwen2.5:3b"), ("ollama".into(), "qwen2.5:3b".into()));
+        assert_eq!(parse_model_ref("p123_456::deepseek-chat"), ("p123_456".into(), "deepseek-chat".into()));
+        // 旧值（纯模型名）向后兼容为本地
+        assert_eq!(parse_model_ref("qwen2.5:3b"), ("ollama".into(), "qwen2.5:3b".into()));
+    }
+
+    #[test]
+    fn normalize_openai_tool_calls_parses_arguments_string() {
+        // OpenAI 的 arguments 是 JSON 字符串
+        let calls = vec![json!({"id":"call_1","function":{"name":"mem_add","arguments":"{\"content\":\"记住我\"}"}})];
+        let out = normalize_tool_calls(Some(&calls), true);
+        assert_eq!(out[0]["function"]["name"], "mem_add");
+        assert_eq!(out[0]["function"]["arguments"]["content"], "记住我");
+    }
+
+    #[test]
+    fn normalize_ollama_tool_calls_keeps_object_arguments() {
+        // Ollama 的 arguments 已是对象
+        let calls = vec![json!({"function":{"name":"list_tasks","arguments":{"limit":5}}})];
+        let out = normalize_tool_calls(Some(&calls), false);
+        assert_eq!(out[0]["function"]["arguments"]["limit"], 5);
+    }
+
+    #[test]
+    fn normalize_tool_calls_skips_invalid() {
+        let calls = vec![json!({"function":{"name":"","arguments":{}}}), json!({"function":{"name":"ok","arguments":"bad-json"}})];
+        let out = normalize_tool_calls(Some(&calls), true);
+        assert_eq!(out.len(), 1); // 空名跳过；坏 JSON 退化为 {} 但保留
+        assert_eq!(out[0]["function"]["arguments"], json!({}));
+    }
 }
+

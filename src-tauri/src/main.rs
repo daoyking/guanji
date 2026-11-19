@@ -40,6 +40,12 @@ fn main() {
             modules::model::list_ollama_models,
             modules::model::pull_ollama_model,
             modules::model::delete_ollama_model,
+            // Cloud model providers (OpenAI-compatible)
+            modules::provider::provider_list,
+            modules::provider::provider_save,
+            modules::provider::provider_delete,
+            modules::provider::provider_list_models,
+            modules::provider::provider_test,
             // Scheduled tasks
             modules::tasks::list_tasks,
             modules::tasks::add_task,
