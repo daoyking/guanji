@@ -318,13 +318,8 @@ fn trash_files_to(paths: Vec<String>, trash: &Path) -> TrashResult {
 }
 
 /// Clean temp/cache files: actually move them to Trash (recoverable).
-#[tauri::command]
-pub async fn clean_temp_files() -> Result<serde_json::Value, String> {
-    let mut freed_bytes = 0u64;
-    let mut cleaned_count = 0usize;
-    let mut fails: Vec<String> = Vec::new();
-
-    // 只针对明确的缓存目录整体处理，避免误伤用户数据
+/// 缓存清理的目标目录（与环境无关，供预估与清理共用，避免两处逻辑漂移）
+fn temp_cache_targets() -> Vec<PathBuf> {
     let mut targets: Vec<PathBuf> = Vec::new();
     if let Some(cache) = dirs::cache_dir() {
         targets.push(cache.join("Tencent"));
@@ -332,6 +327,25 @@ pub async fn clean_temp_files() -> Result<serde_json::Value, String> {
     if let Some(home) = dirs::home_dir() {
         targets.push(home.join(".cache"));
     }
+    targets
+}
+
+/// 预估缓存清理可释放的字节数（不执行删除），用于阈值判断。
+pub fn estimate_temp_cache_bytes() -> u64 {
+    temp_cache_targets().iter()
+        .filter(|p| p.exists() && p.is_dir())
+        .filter_map(|p| dir_size(p).ok())
+        .sum()
+}
+
+#[tauri::command]
+pub async fn clean_temp_files() -> Result<serde_json::Value, String> {
+    let mut freed_bytes = 0u64;
+    let mut cleaned_count = 0usize;
+    let mut fails: Vec<String> = Vec::new();
+
+    // 只针对明确的缓存目录整体处理，避免误伤用户数据
+    let targets = temp_cache_targets();
 
     for path in targets {
         if !path.exists() || !path.is_dir() {

@@ -387,6 +387,8 @@ fn system_prompt(successes: &[String], failures: &[String]) -> String {
 - 用户要「定闹钟/提醒我 X 分钟后」时，用 set_reminder。
 - 需要真正执行系统操作时用 run_command（危险命令会被自动拦截，可放心尝试）。
 - 文件删除、清理类操作前先扫描确认，再执行，并在回答中说清楚做了什么。
+- **工具返回「已清理/已移到废纸篓/已删除」表示操作已经完成，绝不能再让用户手动确认或重复删除。直接用一句话报告实际释放量和结果即可。**
+- 工具返回「用户取消了」时，如实告知用户操作被取消，不要编造「已完成」。
 - 任务完成后，如果结果重要，用 notify 工具告知用户。
 - 回答用中文，简洁、直接、有条理。"#,
         tools = serde_json::to_string_pretty(&tools_schema()).unwrap_or_default(),
@@ -743,9 +745,51 @@ fn extract_after<'a>(text: &'a str, marker: &str) -> Option<&'a str> {
 
 // ─── 工具执行分发 ──────────────────────────────────────────────
 
+/// 自动执行策略：ask=全部确认（默认），safe=可恢复操作自动、危险操作确认，all=全部自动
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum AutoMode { Ask, Safe, All }
+
+fn auto_mode() -> AutoMode {
+    // 默认 safe：清理类操作移到废纸篓可恢复，无需每次确认；危险命令/写入仍确认
+    match crate::db::get_setting_inner("agent_auto_mode").unwrap_or_default().as_str() {
+        "ask" => AutoMode::Ask,
+        "all" => AutoMode::All,
+        _ => AutoMode::Safe,
+    }
+}
+
+/// 清理自动执行阈值（MB）。0 表示不启用阈值，safe 档下可恢复操作直接放行。
+fn auto_clean_threshold_mb() -> f64 {
+    crate::db::get_setting_inner("agent_auto_threshold_mb")
+        .ok()
+        .and_then(|s| s.trim().parse::<f64>().ok())
+        .filter(|v| *v >= 0.0)
+        .unwrap_or(0.0)
+}
+
+/// 判断一个工具在执行前是否需要弹窗确认。
+/// 把策略判断抽成纯函数以便单测；estimated_mb 为 clean_temp_files 的预估释放量。
+fn needs_confirm(mode: AutoMode, name: &str, threshold_mb: f64, estimated_mb: f64) -> bool {
+    if mode == AutoMode::All { return false; }
+    // clean_temp_files 移到废纸篓可恢复，safe 档默认自动；设置阈值后仅小额自动
+    if name == "clean_temp_files" && mode == AutoMode::Safe {
+        return threshold_mb > 0.0 && estimated_mb > threshold_mb;
+    }
+    true
+}
+
 async fn execute_tool(app: &AppHandle, name: &str, args: &Value) -> Result<String, String> {
     // ── 破坏性操作二次确认（human-in-the-loop）──
     // 这些工具会改变用户系统状态，执行前必须由用户明确同意。
+    // 可在设置里切换自动执行策略（ask / safe / all）。
+    let mode = auto_mode();
+    let threshold_mb = auto_clean_threshold_mb();
+    // 仅当策略可能放行清理时才预扫描大小（避免每次无谓的目录遍历）
+    let estimated_mb = if name == "clean_temp_files" && mode == AutoMode::Safe && threshold_mb > 0.0 {
+        crate::modules::file::estimate_temp_cache_bytes() as f64 / 1_000_000.0
+    } else {
+        0.0
+    };
     let confirm_desc = match name {
         "run_command" => Some(format!("执行命令：{}", args["command"].as_str().unwrap_or(""))),
         "write_file" => Some(format!("写入文件：{}（{}）",
@@ -756,7 +800,8 @@ async fn execute_tool(app: &AppHandle, name: &str, args: &Value) -> Result<Strin
         _ => None,
     };
     if let Some(desc) = confirm_desc {
-        if !request_confirm(app, desc).await {
+        // 无需确认的工具（自动放行）不进入等待，避免每次都弹窗
+        if needs_confirm(mode, name, threshold_mb, estimated_mb) && !request_confirm(app, desc).await {
             return Err("用户取消了此操作".to_string());
         }
     }
@@ -1505,6 +1550,23 @@ mod tests {
         enrich_history_traces(&mut msgs);
         let c = msgs[0]["content"].as_str().unwrap();
         assert!(c.contains("mem_list() ✗"));
+    }
+
+    #[test]
+    fn auto_mode_respects_confirmation_policies() {
+        // ask：全部确认
+        assert!(needs_confirm(AutoMode::Ask, "clean_temp_files", 0.0, 1.0));
+        assert!(needs_confirm(AutoMode::Ask, "run_command", 0.0, 0.0));
+        // all：全部自动
+        assert!(!needs_confirm(AutoMode::All, "run_command", 0.0, 0.0));
+        assert!(!needs_confirm(AutoMode::All, "clean_temp_files", 500.0, 9999.0));
+        // safe：可恢复的清理自动，危险操作仍确认
+        assert!(!needs_confirm(AutoMode::Safe, "clean_temp_files", 0.0, 9999.0));
+        assert!(needs_confirm(AutoMode::Safe, "run_command", 0.0, 0.0));
+        assert!(needs_confirm(AutoMode::Safe, "write_file", 0.0, 0.0));
+        // safe + 阈值：低于阈值自动，超过则确认
+        assert!(!needs_confirm(AutoMode::Safe, "clean_temp_files", 500.0, 120.0));
+        assert!(needs_confirm(AutoMode::Safe, "clean_temp_files", 500.0, 800.0));
     }
 
     #[test]
