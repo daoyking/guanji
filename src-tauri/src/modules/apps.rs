@@ -119,6 +119,49 @@ pub fn launch_app(path: String) -> Result<(), String> {
     Ok(())
 }
 
+/// 收集明确归属该应用的用户数据路径（均在 ~/Library 下）。
+/// 只用 bundle id / 应用名做精确匹配，避免误删其他应用数据。
+fn app_data_candidates(app_name: &str, bundle_id: &str) -> Vec<PathBuf> {
+    let home = match dirs::home_dir() {
+        Some(h) => h,
+        None => return Vec::new(),
+    };
+    let lib = home.join("Library");
+    let mut v: Vec<PathBuf> = Vec::new();
+
+    // bundle id 精确的容器/缓存目录
+    if !bundle_id.is_empty() && !bundle_id.contains('/') {
+        for base in [
+            "Containers", "Group Containers", "Caches", "Saved Application State",
+            "HTTPStorages", "WebKit", "Application Scripts", "Autosave Information",
+        ] {
+            v.push(lib.join(base).join(bundle_id));
+        }
+        v.push(lib.join("Application Support").join(bundle_id));
+        v.push(lib.join("Logs").join(bundle_id));
+        v.push(lib.join("Preferences").join(format!("{}.plist", bundle_id)));
+        v.push(lib.join("LaunchAgents").join(format!("{}.plist", bundle_id)));
+    }
+    // 应用名目录（部分老应用不用 bundle id 命名）
+    if !app_name.is_empty() && !app_name.contains('/') {
+        for base in ["Application Support", "Caches", "Logs"] {
+            v.push(lib.join(base).join(app_name));
+        }
+    }
+    // ByHost 偏好：文件名以 bundle id 开头
+    if !bundle_id.is_empty() {
+        if let Ok(rd) = fs::read_dir(lib.join("Preferences/ByHost")) {
+            let prefix = format!("{}.", bundle_id);
+            for e in rd.flatten() {
+                if e.file_name().to_string_lossy().starts_with(&prefix) {
+                    v.push(e.path());
+                }
+            }
+        }
+    }
+    v
+}
+
 /// 清理单个应用的用户数据（容器/缓存/偏好），移到废纸篓可恢复。
 /// 只清理明确属于该应用且位于 ~/Library 下的目录，不碰应用本体。
 #[tauri::command]
@@ -132,26 +175,12 @@ pub fn cleanup_app_data(path: String) -> Result<String, String> {
         return Err("无法识别应用标识".into());
     }
 
-    let home = dirs::home_dir().ok_or("无法定位用户主目录")?;
-    let library = home.join("Library");
-
-    // 应用数据的标准位置，只取明确归属于该 app 的项
-    let mut candidates: Vec<PathBuf> = vec![
-        library.join("Containers").join(&bundle_id),
-        library.join("Group Containers").join(&bundle_id),
-        library.join("Application Support").join(&app_name),
-        library.join("Application Support").join(&bundle_id),
-        library.join("Caches").join(&bundle_id),
-        library.join("Logs").join(&app_name),
-        library.join("Saved Application State").join(&bundle_id),
-    ];
-    candidates.retain(|p| !bundle_id.is_empty() || p.file_name().and_then(|n| n.to_str()) == Some(app_name.as_str()));
-
+    let candidates = app_data_candidates(&app_name, &bundle_id);
     let mut freed = 0u64;
     let mut count = 0usize;
     let mut fails = Vec::new();
     for dir in candidates {
-        if !dir.exists() || !dir.is_dir() {
+        if !dir.exists() {
             continue;
         }
         let size = crate::modules::dir_size(&dir);
@@ -173,7 +202,65 @@ pub fn cleanup_app_data(path: String) -> Result<String, String> {
     Ok(msg)
 }
 
-/// 卸载应用：把 .app 整体移到废纸篓（可恢复，不永久删除）。
+/// 从程序坞移除指向该应用的图标（含分隔占位）。返回是否实际改动。
+/// 直接改 plist 后重启 Dock；cfprefsd 缓存也一并失效，避免改动被回滚。
+fn remove_dock_icon(app_path: &Path) -> Result<bool, String> {
+    let canonical = app_path.canonicalize().unwrap_or_else(|_| app_path.to_path_buf());
+    let script = r#"
+import plistlib, os, sys, urllib.parse
+target = os.path.realpath(sys.argv[1]).rstrip('/')
+plist = os.path.expanduser('~/Library/Preferences/com.apple.dock.plist')
+def norm(u):
+    if not isinstance(u, str): return ''
+    s = urllib.parse.unquote(u)
+    if s.startswith('file://'): s = s[7:]
+    return os.path.realpath(s).rstrip('/')
+try:
+    with open(plist, 'rb') as f: d = plistlib.load(f)
+except Exception:
+    print('0'); raise SystemExit(0)
+changed, kept_all = False, True
+for key in ('persistent-apps', 'persistent-others'):
+    arr = d.get(key) or []
+    keep = []
+    for item in arr:
+        td = item.get('tile-data') or {}
+        fd = td.get('file-data') or {}
+        matched = bool(target) and norm(fd.get('_CFURLString', '')) == target
+        if matched: changed = True
+        else: keep.append(item)
+    if len(keep) != len(arr): d[key] = keep
+if changed:
+    try:
+        with open(plist, 'wb') as f: plistlib.dump(d, f)
+        print('1')
+    except Exception:
+        print('0')
+else:
+    print('0')
+"#;
+    let out = Command::new("python3")
+        .arg("-c").arg(script)
+        .arg(&canonical)
+        .output()
+        .map_err(|e| format!("无法更新程序坞: {}", e))?;
+    let changed = out.status.success() && String::from_utf8_lossy(&out.stdout).trim() == "1";
+    if changed {
+        // cfprefsd 缓存会让 Dock 读回旧值，先失效缓存再重启 Dock
+        let _ = Command::new("killall").arg("cfprefsd").output();
+        let _ = Command::new("killall").arg("Dock").output();
+    }
+    Ok(changed)
+}
+
+/// 注销 LaunchServices 注册，清除「应用程序 / 启动台」里的残留图标记录。
+fn unregister_launchservices(app_path: &Path) -> bool {
+    let ls = "/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister";
+    Command::new(ls).arg("-u").arg(app_path).output()
+        .map(|o| o.status.success()).unwrap_or(false)
+}
+
+/// 卸载应用：应用本体 + 用户数据一起移到废纸篓，并清理程序坞与启动台残留。
 /// 安全闸门：只允许 /Applications 与 ~/Applications 下的 .app。
 #[tauri::command]
 pub fn uninstall_app(path: String) -> Result<String, String> {
@@ -190,10 +277,47 @@ pub fn uninstall_app(path: String) -> Result<String, String> {
         return Err("出于安全考虑，只允许卸载 /Applications 或 ~/Applications 中的应用".into());
     }
 
-    let name = canon.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+    let (app_name, bundle_id) = read_plist(&canon);
+    let display_name = if app_name.is_empty() {
+        canon.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default()
+    } else { app_name.clone() };
+
+    let mut notes: Vec<String> = Vec::new();
+    let mut fails: Vec<String> = Vec::new();
+
+    // 1) 先注销 LaunchServices / 移除 Dock 图标（需在应用移动前，路径还有效）
+    if unregister_launchservices(&canon) {
+        notes.push("已注销应用程序注册".into());
+    }
+    match remove_dock_icon(&canon) {
+        Ok(true) => notes.push("已移除程序坞图标".into()),
+        Ok(false) => {}
+        Err(e) => fails.push(format!("程序坞图标: {}", e)),
+    }
+
+    // 2) 用户数据移到废纸篓
+    let mut freed = 0u64;
+    let mut data_count = 0usize;
+    for dir in app_data_candidates(&app_name, &bundle_id) {
+        if !dir.exists() { continue; }
+        let size = crate::modules::dir_size(&dir);
+        match crate::modules::move_to_trash(&dir) {
+            Ok(_) => { freed += size; data_count += 1; }
+            Err(e) => fails.push(format!("数据 {}: {}", dir.file_name().unwrap_or_default().to_string_lossy(), e)),
+        }
+    }
+
+    // 3) 应用本体移到废纸篓（find 兜底处理权限/系统保护项）
     let size = crate::modules::dir_size(&canon);
     crate::modules::move_to_trash(&canon)?;
-    Ok(format!("已将「{}」移到废纸篓（约 {:.1} MB），可从废纸篓恢复", name, size as f64 / MB as f64))
+
+    let mut msg = format!(
+        "已将「{}」及其 {} 项数据移到废纸篓（应用约 {:.1} MB，数据约 {:.1} MB，可恢复）",
+        display_name, data_count, size as f64 / MB as f64, freed as f64 / MB as f64
+    );
+    if !notes.is_empty() { msg.push_str("\n· "); msg.push_str(&notes.join("；")); }
+    if !fails.is_empty() { msg.push_str(&format!("\n部分项未完成：{}", fails.join("；"))); }
+    Ok(msg)
 }
 
 #[cfg(test)]
@@ -214,6 +338,28 @@ mod tests {
         let dirs = app_directories();
         assert_eq!(dirs[0], PathBuf::from("/Applications"));
         assert!(dirs.iter().any(|d| d.ends_with("Applications") && d != &PathBuf::from("/Applications")));
+    }
+
+    #[test]
+    fn data_candidates_are_scoped_to_bundle_and_app_name() {
+        let v = app_data_candidates("Obsidian", "md.obsidian");
+        assert!(!v.is_empty());
+        // 所有候选都在 ~/Library 下
+        let home = dirs::home_dir().unwrap();
+        let lib = home.join("Library");
+        assert!(v.iter().all(|p| p.starts_with(&lib)), "存在越界路径");
+        // 关键目录齐全
+        assert!(v.iter().any(|p| p.ends_with("Containers/md.obsidian")));
+        assert!(v.iter().any(|p| p.ends_with("Caches/md.obsidian")));
+        assert!(v.iter().any(|p| p.ends_with("Application Support/Obsidian")));
+        assert!(v.iter().any(|p| p.ends_with("Preferences/md.obsidian.plist")));
+    }
+
+    #[test]
+    fn data_candidates_reject_path_traversal_in_identifier() {
+        // 恶意 bundle id 含 / 时不得生成越界路径
+        let v = app_data_candidates("x", "../../etc");
+        assert!(v.iter().all(|p| p.starts_with(dirs::home_dir().unwrap().join("Library"))));
     }
 }
 

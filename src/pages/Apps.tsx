@@ -140,7 +140,14 @@ export default function Apps() {
         <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
           <div className="bg-white dark:bg-gray-800 rounded-xl p-6 max-w-md w-full mx-4">
             <h3 className="text-lg font-medium text-gray-900 dark:text-white mb-2">确认卸载</h3>
-            <p className="text-sm text-gray-500 dark:text-gray-400 mb-4">将删除 "{showConfirm.app.name}" 及其所有相关数据，此操作不可撤销。</p>
+            <p className="text-sm text-gray-500 dark:text-gray-400 mb-2">
+              将卸载 "{showConfirm.app.name}"，并一并清理：
+            </p>
+            <ul className="list-disc list-inside text-sm text-gray-500 dark:text-gray-400 mb-4 space-y-1">
+              <li>应用程序本体与用户数据（缓存 / 容器 / 偏好）</li>
+              <li>程序坞图标与应用程序注册记录</li>
+            </ul>
+            <p className="text-xs text-green-600 dark:text-green-400 mb-4">应用与数据均移到废纸篓，可随时恢复。</p>
             <div className="flex gap-3 justify-end">
               <button onClick={() => setShowConfirm(null)} className="px-4 py-2 text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-700 rounded-lg">取消</button>
               <button onClick={() => uninstallApp(showConfirm.app)} className="px-4 py-2 bg-red-600 text-white rounded-lg hover:bg-red-700">确认卸载</button>

@@ -15,6 +15,7 @@ pub mod apps;
 
 use std::fs;
 use std::path::Path;
+use std::process::Command;
 use std::time::SystemTime;
 
 /// 递归计算目录大小（字节）。max_depth 为 0 表示不限制。
@@ -51,8 +52,37 @@ pub fn dir_size(path: &Path) -> u64 {
     dir_size_limited(path, 0)
 }
 
+/// 用 AppleScript 让 Finder 把目标移到废纸篓。
+/// 相比 fs::rename，Finder 走系统授权，能处理 root 属主应用、系统保护项、
+/// 以及跨磁盘（外接卷）移动，是 macOS 上“移到废纸篓”的官方途径。
+fn move_to_trash_via_finder(path: &Path) -> Result<(), String> {
+    let abs = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|e| format!("无法获取当前目录: {}", e))?
+            .join(path)
+    };
+    let raw = abs.to_string_lossy();
+    // AppleScript 字符串转义：反斜杠与双引号
+    let escaped = raw.replace('\\', "\\\\").replace('"', "\\\"");
+    let script = format!("tell application \"Finder\" to delete POSIX file \"{}\"", escaped);
+    let out = Command::new("osascript")
+        .arg("-e")
+        .arg(&script)
+        .output()
+        .map_err(|e| format!("无法调用 Finder: {}", e))?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        Err(if err.is_empty() { "Finder 拒绝移动该项".into() } else { err })
+    }
+}
+
 /// 把文件或目录移到废纸篓（可恢复，不永久删除）。
-/// 同名目标自动加时间戳后缀，避免覆盖已有内容。
+/// 优先用 fs::rename（快、无副作用）；遇到权限不足（os error 13）、
+/// 跨磁盘（os error 18）等失败时，回退到 Finder，由系统处理授权与跨卷移动。
 pub fn move_to_trash(path: &Path) -> Result<(), String> {
     let home = dirs::home_dir().ok_or("无法定位用户主目录")?;
     let trash = home.join(".Trash");
@@ -68,13 +98,15 @@ pub fn move_to_trash(path: &Path) -> Result<(), String> {
             .as_secs();
         dest = trash.join(format!("{}.{}", name, stamp));
     }
-    fs::rename(path, &dest).map_err(|e| {
-        if e.raw_os_error() == Some(18) {
-            "跨磁盘移动失败，请手动处理".into()
-        } else {
-            format!("移动失败: {}", e)
+    match fs::rename(path, &dest) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            // 权限不足 / 跨磁盘 / 系统保护项：交给 Finder 走系统授权
+            move_to_trash_via_finder(path).map_err(|finder_err| {
+                format!("移动失败（{}）；Finder 兜底也失败：{}", e, finder_err)
+            })
         }
-    })
+    }
 }
 
 /// 按【字符数】安全截断字符串（UTF-8 中文按字节切片会 panic）。
