@@ -211,6 +211,77 @@ pub async fn list_large_files(threshold_mb: f64, limit: usize) -> Result<Vec<Fil
     Ok(results)
 }
 
+/// 判断 Spotlight 结果路径是否应排除：系统关键路径或 .app 包内部。
+fn spotlight_path_excluded(path: &Path) -> bool {
+    let canon = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let canon_str = canon.to_string_lossy().to_string();
+    let forbidden = ["/System", "/usr", "/bin", "/sbin", "/Library", "/private"];
+    if forbidden.iter().any(|p| canon_str == *p || canon_str.starts_with(&format!("{}/", p))) {
+        return true;
+    }
+    // 应用包内部资源不属于用户文稿
+    path.components().any(|c| c.as_os_str().to_string_lossy().ends_with(".app"))
+}
+
+/// 全盘扫描大文件：基于 macOS Spotlight 元数据（mdfind），0.1 秒级覆盖整个磁盘，
+/// 与系统「储存空间 → 文稿」用同一套索引。这是大文件列表的默认方式——
+/// 旧的递归扫描只覆盖 Downloads/Documents 等少数目录，模型文件（~/Models）、
+/// 归档（~/Archive）等大文件根本扫不到。
+///
+/// 过滤规则：
+/// - 应用只按大小查普通文件（kMDItemFSSize > bytes），再逐个 metadata 复核；
+/// - 排除 .app 包内部（属于应用，不算用户文稿）、系统关键路径、用户忽略项；
+/// - Spotlight 不可用（命令失败）时返回明确错误，由前端提示改用目录扫描。
+#[tauri::command]
+pub async fn scan_all_large_files(threshold_mb: f64, limit: usize) -> Result<Vec<FileEntry>, String> {
+    let threshold = (threshold_mb * MB as f64) as u64;
+    if threshold == 0 {
+        return Err("阈值必须大于 0 MB".into());
+    }
+    let ignores = read_list(KEY_IGNORE_DIRS, default_ignore_dirs());
+    let query = format!("kMDItemFSSize > {}", threshold);
+
+    let out = tokio::process::Command::new("/usr/bin/mdfind")
+        .arg(&query)
+        .output()
+        .await
+        .map_err(|e| format!("无法调用 Spotlight 扫描: {}", e))?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        return Err(format!("Spotlight 扫描失败: {}", if err.is_empty() { "未知错误" } else { &err }));
+    }
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let mut results: Vec<FileEntry> = Vec::new();
+    for line in stdout.lines() {
+        let path_str = line.trim();
+        if path_str.is_empty() { continue; }
+        let path = PathBuf::from(path_str);
+
+        // 只处理普通文件；.app 包内部（应用资源）不算用户文稿
+        if !path.is_file() { continue; }
+        if path.components().any(|c| c.as_os_str().to_string_lossy().ends_with(".app")) { continue; }
+
+        // 系统关键路径 / 应用包内部一律排除
+        if spotlight_path_excluded(&path) { continue; }
+
+        // 用户忽略项（路径规则 + 名称规则）
+        if is_ignored(&path, &ignores) { continue; }
+
+        let meta = match fs::metadata(&path) { Ok(m) => m, Err(_) => continue };
+        if meta.len() < threshold { continue; }
+        results.push(FileEntry {
+            path: path_str.to_string(),
+            name: path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default(),
+            size_mb: meta.len() as f64 / MB as f64,
+            modified: format!("{:?}", meta.modified().unwrap_or(SystemTime::UNIX_EPOCH)),
+        });
+    }
+    results.sort_by(|a, b| b.size_mb.partial_cmp(&a.size_mb).unwrap());
+    results.truncate(limit);
+    Ok(results)
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct TrashFailure {
     pub path: String,
@@ -478,6 +549,20 @@ mod tests {
         let pics = home.join("Pictures");
         assert!(is_ignored(&pics, &ignores));
         assert!(is_ignored(&pics.join("sub"), &ignores));
+    }
+
+    #[test]
+    fn spotlight_excludes_system_and_app_bundle_paths() {
+        // 系统路径
+        assert!(spotlight_path_excluded(Path::new("/System/Library/foo")));
+        assert!(spotlight_path_excluded(Path::new("/usr/bin/foo")));
+        assert!(spotlight_path_excluded(Path::new("/private/var/foo")));
+        // 应用包内部
+        assert!(spotlight_path_excluded(Path::new("/Applications/WeChat.app/Contents/MacOS/foo")));
+        assert!(spotlight_path_excluded(Path::new("/Users/me/Applications/Xcode.app/Contents/foo")));
+        // 用户文件应保留
+        assert!(!spotlight_path_excluded(Path::new("/Users/me/Models/big.gguf")));
+        assert!(!spotlight_path_excluded(Path::new("/Users/me/Archive/model.safetensors")));
     }
 }
 

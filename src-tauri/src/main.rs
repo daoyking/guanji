@@ -19,6 +19,7 @@ fn main() {
             modules::system::kill_process,
             modules::system::clean_memory,
             // File management
+            modules::file::scan_all_large_files,
             modules::file::list_large_files,
             modules::file::trash_files,
             modules::file::clean_temp_files,

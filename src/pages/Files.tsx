@@ -27,6 +27,9 @@ export default function Files() {
   const [saving, setSaving] = useState(false);
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [deleting, setDeleting] = useState(false);
+  const [thresholdMb, setThresholdMb] = useState(100);
+  const [scanMode, setScanMode] = useState<'spotlight' | 'dirs'>('spotlight');
+  const [scanError, setScanError] = useState('');
 
   const loadConfig = async () => {
     try {
@@ -37,15 +40,20 @@ export default function Files() {
     }
   };
 
-  const loadLargeFiles = async () => {
+  const loadLargeFiles = async (mode = scanMode, threshold = thresholdMb) => {
     setLoading(true);
+    setScanError('');
     try {
-      const files = await invoke<any[]>('list_large_files', { thresholdMb: 50, limit: 20 });
+      const files = mode === 'spotlight'
+        ? await invoke<any[]>('scan_all_large_files', { thresholdMb: threshold, limit: 200 })
+        : await invoke<any[]>('list_large_files', { thresholdMb: threshold, limit: 200 });
       setLargeFiles(files);
       // 清掉已不存在文件的选中态
       const valid = new Set(files.map((f) => f.path));
       setSelected((prev) => new Set([...prev].filter((p) => valid.has(p))));
     } catch (e) {
+      const msg = String(e);
+      setScanError(msg);
       console.error('Failed to load large files:', e);
     } finally {
       setLoading(false);
@@ -57,7 +65,7 @@ export default function Files() {
     try {
       await invoke('file_set_scan_dirs', { dirs });
       setConfig(prev => ({ ...prev, scan_dirs: dirs }));
-      await loadLargeFiles();
+      await loadLargeFiles('dirs');
     } catch (e) {
       alert(`保存扫描目录失败: ${e}`);
     } finally {
@@ -168,8 +176,18 @@ export default function Files() {
 
   useEffect(() => {
     loadConfig();
-    loadLargeFiles();
+    loadLargeFiles('spotlight', 100);
   }, []);
+
+  const changeMode = (mode: 'spotlight' | 'dirs') => {
+    setScanMode(mode);
+    loadLargeFiles(mode, thresholdMb);
+  };
+
+  const changeThreshold = (value: number) => {
+    setThresholdMb(value);
+    loadLargeFiles(scanMode, value);
+  };
 
   const ruleKind = (rule: string) => (rule.includes('/') || rule.startsWith('~') ? '路径' : '名称');
 
@@ -188,7 +206,8 @@ export default function Files() {
       {configOpen && (
         <div className="bg-white dark:bg-gray-800 rounded-xl p-6 card-shadow space-y-6">
           <p className="text-sm text-gray-500 dark:text-gray-400">
-            选择要扫描的文件夹，以及扫描时忽略的文件夹。修改后立即生效。
+            「忽略的文件夹」对全盘扫描和指定目录扫描都生效。「扫描目录」仅在下方切换到「指定目录」模式时使用；
+            全盘扫描基于 Spotlight 索引，无需配置扫描目录。
           </p>
 
           <div>
@@ -284,7 +303,7 @@ export default function Files() {
 
       <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
         <StatBox title="临时文件" value={tempStats ? `${(tempStats.freed_bytes / 1_000_000).toFixed(1)} MB` : '--'} description={`${tempStats?.cleaned_count || 0} 个文件已清理`} />
-        <StatBox title="大文件 (>50MB)" value={largeFiles.length.toString()} description="占用大量空间" />
+        <StatBox title={`大文件 (>${thresholdMb}MB)`} value={largeFiles.length.toString()} description={scanMode === 'spotlight' ? '全盘扫描' : '仅扫描目录'} />
         <StatBox title="忽略规则" value={config.ignore_dirs.length.toString()} description="已配置的忽略项" />
       </div>
 
@@ -301,7 +320,7 @@ export default function Files() {
       </div>
 
       <div id="files-scan" className="bg-white dark:bg-gray-800 rounded-xl p-6 card-shadow">
-        <div className="flex items-center justify-between mb-4 flex-wrap gap-2">
+        <div className="flex items-center justify-between mb-3 flex-wrap gap-2">
           <h3 className="text-lg font-medium text-gray-900 dark:text-white">
             大文件列表
             {largeFiles.length > 0 && (
@@ -310,17 +329,54 @@ export default function Files() {
           </h3>
           <div className="flex items-center gap-4">
             {largeFiles.length > 0 && (
-              <button onClick={toggleAll} className="text-sm text-blue-600 hover:text-blue-700">
+              <button onClick={() => toggleAll()} className="text-sm text-blue-600 hover:text-blue-700">
                 {selected.size === largeFiles.length ? '取消全选' : '全选'}
               </button>
             )}
-            <button onClick={loadLargeFiles} className="text-sm text-blue-600 hover:text-blue-700">刷新</button>
+            <button onClick={() => loadLargeFiles()} className="text-sm text-blue-600 hover:text-blue-700">刷新</button>
           </div>
         </div>
+
+        {/* 扫描控制条 */}
+        <div className="flex items-center flex-wrap gap-3 mb-3 p-3 bg-gray-50 dark:bg-gray-700/50 rounded-lg">
+          <div className="flex items-center gap-1">
+            {(['spotlight', 'dirs'] as const).map((m) => (
+              <button
+                key={m}
+                onClick={() => changeMode(m)}
+                className={`px-3 py-1.5 text-sm rounded ${scanMode === m ? 'bg-blue-600 text-white' : 'bg-white dark:bg-gray-700 text-gray-600 dark:text-gray-300 border border-gray-200 dark:border-gray-600'}`}
+              >
+                {m === 'spotlight' ? '全盘扫描' : '指定目录'}
+              </button>
+            ))}
+          </div>
+          <label className="flex items-center gap-2 text-sm text-gray-600 dark:text-gray-300">
+            大小超过
+            <select
+              value={thresholdMb}
+              onChange={(e) => changeThreshold(Number(e.target.value))}
+              className="px-2 py-1 text-sm border border-gray-300 dark:border-gray-600 rounded bg-white dark:bg-gray-700 text-gray-900 dark:text-white"
+            >
+              {[50, 100, 500, 1000, 5000].map((v) => <option key={v} value={v}>{v >= 1000 ? `${v / 1000} GB` : `${v} MB`}</option>)}
+            </select>
+          </label>
+          <span className="text-xs text-gray-400 dark:text-gray-500">
+            {scanMode === 'spotlight' ? '基于系统 Spotlight 索引，秒级覆盖全盘（含模型 / 归档 / 下载）' : '仅扫描下方「扫描目录」中配置的文件夹（递归 3 层）'}
+          </span>
+        </div>
+
+        {scanError && (
+          <div className="mb-3 p-3 text-sm bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded-lg text-red-700 dark:text-red-300">
+            扫描失败：{scanError}
+            {scanMode === 'spotlight' && <span className="block mt-1 text-xs">可切换到「指定目录」模式重试。</span>}
+          </div>
+        )}
         {loading ? (
           <p className="text-gray-500 text-sm text-center py-8">扫描中...</p>
         ) : largeFiles.length === 0 ? (
-          <p className="text-gray-500 text-sm text-center py-8">未发现大文件</p>
+          <p className="text-gray-500 text-sm text-center py-8">
+            {scanError ? '暂无结果' : '未发现大文件'}
+          </p>
         ) : (
           <>
             <div className="space-y-2">
